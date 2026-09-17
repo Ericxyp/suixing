@@ -1,0 +1,23 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "esModuleInterop": true,
+    "types": ["node"],
+    "rootDir": ".",
+    "outDir": ".test-dist"
+  },
+  "include": [
+    "src/domain/**/*.ts",
+    "src/mocks/**/*.ts",
+    "src/providers/**/*.ts",
+    "src/repositories/**/*.ts",
+    "src/services/**/*.ts",
+    "src/types/**/*.d.ts",
+    "src/vite-env.d.ts",
+    "server/**/*.ts",
+    "tests/**/*.ts"
+  ],
+  "exclude": ["dist", ".test-dist", "node_modules"]
+}

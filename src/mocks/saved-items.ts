@@ -1,0 +1,46 @@
+import type { SavedItem } from '../domain/saved-items/types';
+
+export const mockSavedItems: readonly SavedItem[] = [
+  {
+    id: 'saved-shanghai-museum',
+    userId: 'user-demo-001',
+    type: 'place',
+    title: '上海博物馆',
+    subtitle: '黄浦区 · 中国古代艺术馆藏',
+    destination: '上海',
+    placeId: 'place-shanghai-museum',
+    tags: ['展览', '建筑'],
+    createdAt: '2026-09-08T00:00:00.000Z',
+  },
+  {
+    id: 'saved-rac-coffee',
+    userId: 'user-demo-001',
+    type: 'place',
+    title: 'RAC Coffee',
+    subtitle: '徐汇区 · 安福路上的咖啡与简餐',
+    destination: '上海',
+    placeId: 'place-rac-coffee',
+    tags: ['咖啡', '街区'],
+    createdAt: '2026-09-09T00:00:00.000Z',
+  },
+  {
+    id: 'saved-hangzhou',
+    userId: 'user-demo-001',
+    type: 'destination',
+    title: '杭州周末慢游',
+    subtitle: '西湖边住两晚，留出喝茶和散步的时间。',
+    destination: '杭州',
+    tags: ['湖景', '慢游'],
+    createdAt: '2026-09-10T00:00:00.000Z',
+  },
+  {
+    id: 'saved-bund-walk',
+    userId: 'user-demo-001',
+    type: 'route',
+    title: '外滩日落散步',
+    subtitle: '外白渡桥至十六铺，适合傍晚慢走。',
+    destination: '上海',
+    tags: ['路线', '拍照'],
+    createdAt: '2026-09-11T00:00:00.000Z',
+  },
+];
