@@ -1,15 +1,20 @@
+import { type MouseEvent } from 'react';
+
 export function AskSuixingButton({
   onClick,
   disabled = false,
+  label = '问随行',
 }: {
-  onClick: () => void;
+  onClick: (event: MouseEvent<HTMLButtonElement>) => void;
   disabled?: boolean;
+  label?: string;
 }) {
   return (
     <button
       className="ask-suixing-entry"
       type="button"
       disabled={disabled}
+      aria-label={label}
       onClick={onClick}
     >
       <svg className="ask-suixing-entry__icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -21,7 +26,7 @@ export function AskSuixingButton({
           strokeLinejoin="round"
         />
       </svg>
-      问随行
+      {label}
     </button>
   );
 }

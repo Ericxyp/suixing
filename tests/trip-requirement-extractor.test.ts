@@ -32,6 +32,10 @@ const completeModelJson = {
     mustVisit: [],
     avoid: [],
   },
+  tripIntent: null,
+  partyContext: null,
+  constraints: null,
+  profilePatch: null,
 };
 
 class FakeAiProvider implements AiProvider {
@@ -70,6 +74,10 @@ function emptyDraftJson(
       mustVisit: [],
       avoid: [],
     },
+    tripIntent: null,
+    partyContext: null,
+    constraints: null,
+    profilePatch: null,
     ...overrides,
   };
 }
@@ -103,7 +111,7 @@ test('extracts a complete Chinese travel request into a normalized draft', async
   assert.deepEqual(result.missingRequiredFields, []);
   assert.equal(provider.calls.length, 1);
   assert.equal(provider.calls[0].temperature, 0);
-  assert.equal(provider.calls[0].maxOutputTokens, 400);
+  assert.equal(provider.calls[0].maxOutputTokens, 700);
   assert.equal(provider.calls[0].enableThinking, false);
   assert.deepEqual(provider.calls[0].jsonSchema, TRIP_REQUIREMENT_JSON_SCHEMA);
   assert.equal(provider.calls[0].jsonSchema?.name, TRIP_REQUIREMENT_JSON_SCHEMA.name);
@@ -276,4 +284,62 @@ test('does not mutate the model JSON string or caller input', async () => {
   const input = ` ${COMPLETE_REQUEST} `;
   await extractor.extract(input);
   assert.equal(input, ` ${COMPLETE_REQUEST} `);
+});
+
+function profilePatchWith(signals: Record<string, { value: number; confidence: number; source: string }>) {
+  return {
+    signals: Object.entries(signals).map(([key, signal]) => ({ key, ...signal })),
+  };
+}
+
+test('explicit long-term coffee and photography become a profile patch', () => {
+  const draft = parseRequirementDraft(JSON.stringify(emptyDraftJson({
+    profilePatch: profilePatchWith({
+      coffee: { value: 0.9, confidence: 0.9, source: 'explicit' },
+      photography: { value: 0.85, confidence: 0.8, source: 'explicit' },
+    }),
+  })));
+  assert.equal(draft.tripIntent, undefined);
+  assert.equal(draft.profilePatch?.signals.coffee?.source, 'explicit');
+  assert.equal(draft.profilePatch?.signals.photography?.source, 'explicit');
+});
+
+test('this-trip history intent and shopping constraint do not become a profile patch', () => {
+  const draft = parseRequirementDraft(JSON.stringify(emptyDraftJson({
+    tripIntent: { interestKeys: ['history', 'culture_art'], pace: null },
+    constraints: { excludedInterestKeys: ['shopping'], lowWalking: null },
+    profilePatch: null,
+  })));
+  assert.deepEqual(draft.tripIntent?.interestKeys, ['history', 'culture_art']);
+  assert.deepEqual(draft.constraints?.excludedInterestKeys, ['shopping']);
+  assert.equal(draft.profilePatch, undefined);
+});
+
+test('parents and low walking become party context', () => {
+  const draft = parseRequirementDraft(JSON.stringify(emptyDraftJson({
+    partyContext: {
+      partyType: 'parents',
+      hasElderly: true,
+      mobilityRequirement: 'low_walking',
+    },
+    constraints: { excludedInterestKeys: [], lowWalking: true },
+  })));
+  assert.equal(draft.partyContext?.partyType, 'parents');
+  assert.equal(draft.partyContext?.hasElderly, true);
+  assert.equal(draft.constraints?.lowWalking, true);
+});
+
+test('a single restaurant request does not create a behavioral profile patch', () => {
+  const draft = parseRequirementDraft(JSON.stringify(emptyDraftJson({
+    diningMode: 'arranged',
+    preferences: {
+      interests: ['餐厅'],
+      accommodation: [],
+      mustVisit: [],
+      avoid: [],
+    },
+    profilePatch: null,
+  })));
+  assert.equal(draft.profilePatch, undefined);
+  assert.equal(draft.diningMode, 'arranged');
 });

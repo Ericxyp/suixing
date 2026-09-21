@@ -177,6 +177,27 @@ export function resolveTripMapRoutes(
   });
 }
 
+export const TRIP_MAP_ROUTE_COLOR = '#3B82F6';
+export const TRIP_MAP_MARKER_COLORS = ['#3B82F6', '#F59E0B', '#8B5CF6', '#F97316'] as const;
+
+export function tripMapMarkerColor(index: number): string {
+  return TRIP_MAP_MARKER_COLORS[index % TRIP_MAP_MARKER_COLORS.length];
+}
+
+const MAP_FIT_PADDING = [56, 48, 132, 48] as const;
+
+export function restoreTripMapViewport(
+  map: Pick<AMap.Map, 'setFitView' | 'resize'>,
+  overlays: readonly (AMap.Marker | AMap.Polyline)[],
+): void {
+  if (typeof map.resize === 'function') {
+    map.resize();
+  }
+  if (overlays.length > 0) {
+    map.setFitView(overlays, true, MAP_FIT_PADDING, 15);
+  }
+}
+
 export function summarizeTripMapRoutes(
   routes: readonly TripMapRoute[],
 ): TripMapRouteSummary {

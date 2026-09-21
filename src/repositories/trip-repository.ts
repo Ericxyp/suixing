@@ -1,6 +1,7 @@
 import type { TripChange } from '../domain/trip/trip-change';
 import type { Place, Trip } from '../domain/trip/types';
 import type { TripRequirementDraft } from '../domain/trip/ai';
+import type { TravelProfileSignals } from '../domain/trip/profile';
 
 export interface CreateTripInput {
   userId: string;
@@ -9,6 +10,7 @@ export interface CreateTripInput {
     travelerCount: number;
     totalBudget: number;
     pace: NonNullable<TripRequirementDraft['pace']>;
+    profileSignals?: TravelProfileSignals;
   };
 }
 

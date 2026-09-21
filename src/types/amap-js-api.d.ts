@@ -47,6 +47,7 @@ declare namespace AMap {
     setCenter(center: LngLatLike): void;
     setZoom(zoom: number): void;
     setZoomAndCenter(zoom: number, center: LngLatLike): void;
+    resize(): void;
     destroy(): void;
   }
 

@@ -1,6 +1,11 @@
 import { MouseEvent } from 'react';
 import { Link } from 'react-router-dom';
 import type { Trip } from '../../domain/trip/types';
+import {
+  tripCoverInitial,
+  tripCoverTone,
+  tripHomeStatusLabel,
+} from '../../services/home-presentation';
 import { formatCurrency, formatTripDates } from '../../services/trip-display';
 import { tripListedDayCount } from '../../repositories/local-trip-storage';
 
@@ -19,10 +24,6 @@ export function RecentTripsSection({
   trips: Trip[];
   onDelete: (tripId: string) => void;
 }) {
-  if (trips.length === 0) {
-    return null;
-  }
-
   function confirmDelete(event: MouseEvent<HTMLButtonElement>, trip: Trip) {
     event.preventDefault();
     event.stopPropagation();
@@ -34,38 +35,57 @@ export function RecentTripsSection({
   return (
     <section className="home-section recent-trips" aria-labelledby="recent-trips-title">
       <div className="section-heading">
-        <h2 id="recent-trips-title">最近行程</h2>
+        <div>
+          <h2 id="recent-trips-title">最近行程</h2>
+          <p className="section-heading__lead">继续探索，下一段美好旅程正等着你</p>
+        </div>
       </div>
-      <div className="recent-trip-list">
-        {trips.map((trip) => {
-          const dayCount = tripListedDayCount(trip);
-          const updated = formatUpdatedAt(trip.updatedAt);
-          return (
-            <article className="recent-trip" key={trip.id}>
-              <Link className="recent-trip__link" to={`/trips/${trip.id}`}>
-                <p className="recent-trip__destination">{trip.destination}</p>
-                <p className="recent-trip__meta">
-                  {dayCount ? `${dayCount} 天` : '天数待定'}
-                  {' · '}
-                  {trip.travelerCount} 人
-                  {' · '}
-                  预算 {formatCurrency(trip.totalBudget)}
-                </p>
-                <p className="recent-trip__meta">
-                  {updated ?? formatTripDates(trip)}
-                </p>
-              </Link>
-              <button
-                className="recent-trip__delete"
-                type="button"
-                onClick={(event) => confirmDelete(event, trip)}
-              >
-                删除
-              </button>
-            </article>
-          );
-        })}
-      </div>
+      {trips.length === 0 ? (
+        <p className="recent-trips__empty">还没有行程。回到上面说说你想去哪，开始第一段旅行。</p>
+      ) : (
+        <div className="recent-trip-list">
+          {trips.map((trip) => {
+            const dayCount = tripListedDayCount(trip);
+            const updated = formatUpdatedAt(trip.updatedAt);
+            const status = tripHomeStatusLabel(trip);
+            return (
+              <article className="recent-trip-card" key={trip.id}>
+                <Link className="recent-trip-card__link" to={`/trips/${trip.id}`}>
+                  <div
+                    className={`recent-trip-card__cover recent-trip-card__cover--${tripCoverTone(trip.destination)}`}
+                    aria-hidden="true"
+                  >
+                    <span className="recent-trip-card__initial">{tripCoverInitial(trip.destination)}</span>
+                  </div>
+                  {status && <span className="recent-trip-card__status">{status}</span>}
+                  <div className="recent-trip-card__body">
+                    <p className="recent-trip__destination">{trip.destination}</p>
+                    <p className="recent-trip-card__title">{trip.title}</p>
+                    <p className="recent-trip__meta">
+                      {dayCount ? `${dayCount} 天` : '天数待定'}
+                      {' · '}
+                      {trip.travelerCount} 人
+                      {' · '}
+                      预算 {formatCurrency(trip.totalBudget)}
+                    </p>
+                    <p className="recent-trip__meta">
+                      {updated ?? formatTripDates(trip)}
+                    </p>
+                  </div>
+                </Link>
+                <button
+                  className="recent-trip__delete"
+                  type="button"
+                  aria-label={`删除「${trip.destination}」`}
+                  onClick={(event) => confirmDelete(event, trip)}
+                >
+                  删除
+                </button>
+              </article>
+            );
+          })}
+        </div>
+      )}
     </section>
   );
 }

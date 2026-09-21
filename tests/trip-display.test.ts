@@ -1,6 +1,21 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { formatDistance, formatDuration, formatTripDates, getDefaultTripDayId, itineraryTimelineItems, statusLabel } from '../src/services/trip-display';
+import {
+  formatDistance,
+  formatDuration,
+  formatTripDates,
+  getDefaultTripDayId,
+  itineraryTimelineItems,
+  statusLabel,
+  tripPreferenceTags,
+  dayWorkspaceSummary,
+  formatDayWorkspaceSummary,
+  mealPeriodTitle,
+  restItemTitle,
+  visibleUserText,
+  isInternalDisplayLeak,
+  formatCompactDuration,
+} from '../src/services/trip-display';
 import { mockShanghaiTrip } from '../src/mocks/trips';
 
 test('formats Trip display values', () => {
@@ -113,4 +128,37 @@ test('timeline preserves unique meal slot and place start times', () => {
   const items = itineraryTimelineItems(day);
   assert.deepEqual(items.map((item) => item.startTime), ['10:00', '11:45', '13:35']);
   assert.equal(items.some((item) => item.kind === 'rest'), false);
+});
+
+test('preference tags only include real interests', () => {
+  assert.equal(tripPreferenceTags(mockShanghaiTrip).length, 3);
+  assert.deepEqual(tripPreferenceTags(mockShanghaiTrip), ['咖啡', '拍照', '城市漫步']);
+  const bare = structuredClone(mockShanghaiTrip);
+  bare.preferences = { interests: [] };
+  assert.deepEqual(tripPreferenceTags(bare), []);
+  bare.preferences = { interests: ['', '  ', '博物馆'] };
+  assert.deepEqual(tripPreferenceTags(bare), ['博物馆']);
+});
+
+test('day summary counts trip places and real transit only', () => {
+  const day = mockShanghaiTrip.days[0];
+  const withRoutes = dayWorkspaceSummary(mockShanghaiTrip, day);
+  assert.equal(withRoutes.placeCount, day.places.length);
+  assert.equal(typeof withRoutes.transitMinutes, 'number');
+  const noRoutes = dayWorkspaceSummary({ ...mockShanghaiTrip, routes: [] }, day);
+  assert.equal(noRoutes.transitMinutes, undefined);
+  assert.equal(formatDayWorkspaceSummary({ placeCount: 3 }), '3 个地点');
+  assert.equal(formatDayWorkspaceSummary({ placeCount: 3, transitMinutes: 56 }), '3 个地点 · 交通约 56分钟');
+});
+
+test('schedule labels stay user-facing and hide internal leaks', () => {
+  assert.equal(mealPeriodTitle('lunch', 'meal_slot'), '午餐时间');
+  assert.equal(mealPeriodTitle('dinner', 'meal_place'), '晚餐');
+  assert.equal(restItemTitle('参观后休息'), '参观后休息');
+  assert.equal(restItemTitle('${s.type}'), '午间休息');
+  assert.equal(visibleUserText('undefined'), undefined);
+  assert.equal(visibleUserText('meal_slot'), undefined);
+  assert.equal(isInternalDisplayLeak('$(s.type)'), true);
+  assert.equal(formatCompactDuration(150), '2.5h');
+  assert.equal(formatCompactDuration(75), '1h15min');
 });

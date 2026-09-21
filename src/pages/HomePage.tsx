@@ -87,6 +87,10 @@ export function HomePage() {
       {(savedItemsState.status === 'success' || savedItemsState.status === 'empty') && (
         <SavedItemsSection items={savedItemsState.status === 'success' ? savedItemsState.data : []} />
       )}
+      <footer className="home-footer">
+        <p>随行</p>
+        <p>出发吧，去遇见更广阔的自己</p>
+      </footer>
     </div>
   );
 }

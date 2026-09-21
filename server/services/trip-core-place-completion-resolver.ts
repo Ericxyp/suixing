@@ -1,4 +1,5 @@
 import type { Place, TripPace } from '../../src/domain/trip/types';
+import type { PlanningPolicyV1 } from '../../src/domain/trip/profile';
 import { filterEligibleTripPlaces } from './trip-place-eligibility';
 import {
   rotateClassicCityLabels,
@@ -12,6 +13,22 @@ import { resolveStopDuration } from './trip-stop-duration-resolver';
 import { haversineMeters, isFiniteGeoPoint } from './trip-route-enricher';
 import type { TripPlaceSuggestion } from './trip-plan-generator';
 import { LONG_STAY_MINUTES, resolveTripPace } from './trip-day-density-planner';
+import { rerankCoreCompletionCandidatesV1 } from './trip-core-candidate-ranking-v1';
+import {
+  runCoreCombinationSnapshotShadowV1,
+  scoreDayCoreCombinationSnapshotV1,
+  scorePreRouteCoreCombinationV1,
+  selectCanaryCoreCompletionCandidateV1,
+  snapshotCoreCompletionCandidatesV1,
+  type CanaryCoreCompletionCandidateV1,
+  type CoreCompletionSlotSnapshotV1,
+} from './trip-core-combination-snapshot-v1';
+import type {
+  PartyContextV1,
+  TravelProfileSignals,
+  TripConstraintsV1,
+  TripIntentV1,
+} from '../../src/domain/trip/profile';
 
 export const CORE_COMPLETION_SEARCHES_PER_MISSING = 2;
 export const CORE_COMPLETION_MAX_DISTANCE_METERS = 25_000;
@@ -19,8 +36,66 @@ export const CORE_COMPLETION_MAX_DISTANCE_METERS = 25_000;
 function isCoreStop(stop: ResolvedTripPlaceStop): boolean {
   return stop.place.category !== 'restaurant'
     && stop.place.category !== 'cafe'
+    && stop.place.category !== 'shopping'
     && stop.place.category !== 'transport'
     && stop.place.category !== 'hotel';
+}
+
+const STYLE_PREFERENCE_TERMS = [
+  '咖啡',
+  '咖啡店',
+  '美食',
+  '餐饮',
+  '餐厅',
+  '拍照',
+  '摄影',
+  '购物',
+  '商场',
+  '夜生活',
+  'coffee',
+  'food',
+  'photography',
+  'shopping',
+  'nightlife',
+] as const;
+
+const CORE_INTEREST_KEY_TERMS: Record<string, string> = {
+  history: '历史文化',
+  culture_art: '历史文化',
+  nature: '公园',
+  architecture: '建筑',
+};
+
+export function isStyleCoreCompletionTerm(term: string): boolean {
+  const normalized = term.normalize('NFKC').trim().toLowerCase();
+  if (normalized === '') {
+    return false;
+  }
+  return STYLE_PREFERENCE_TERMS.some((item) => (
+    normalized === item || normalized.includes(item)
+  ));
+}
+
+export function coreCompletionTermFromPreference(term: string): string | undefined {
+  const raw = term.normalize('NFKC').trim();
+  if (raw === '' || isStyleCoreCompletionTerm(raw)) {
+    return undefined;
+  }
+  const mapped = CORE_INTEREST_KEY_TERMS[raw.toLowerCase()];
+  if (mapped) {
+    return mapped;
+  }
+  if (/历史|文化|博物馆|古迹|公园|建筑|自然|艺术|地标|街区/.test(raw)) {
+    return raw;
+  }
+  return undefined;
+}
+
+function hasHistoryCoreIntent(terms: readonly string[]): boolean {
+  return terms.some((term) => {
+    const raw = term.normalize('NFKC').trim().toLowerCase();
+    return /历史|文化|博物馆|古迹|history|culture_art|culture/.test(raw);
+  });
 }
 
 function isRejectedCategory(place: Place): boolean {
@@ -105,26 +180,36 @@ export function coreCompletionQueries(input: {
   hasExplicitTravelPreferences?: boolean;
 }): string[] {
   const queries: string[] = [];
+  const city = input.destination.trim();
   for (const core of input.cores) {
     queries.push(`${core.place.name} 附近 景点`);
   }
   const title = input.day.title.trim();
   if (title !== '') {
-    queries.push(`${input.destination} ${title} 景点`);
+    queries.push(`${city} ${title} 景点`);
   }
-  if (input.hasExplicitTravelPreferences === true) {
-    for (const term of input.preferenceTerms ?? []) {
-      const cleaned = term.trim();
-      if (cleaned !== '') {
-        queries.push(`${input.destination} ${cleaned} 景点`);
-      }
-    }
-  } else {
+  const preferenceTerms = input.preferenceTerms ?? [];
+  const coreTerms = uniqueQueries(
+    preferenceTerms
+      .map((term) => coreCompletionTermFromPreference(term))
+      .filter((term): term is string => term !== undefined),
+  );
+  for (const term of coreTerms) {
+    queries.push(`${city} ${term} 景点`);
+  }
+  if (hasHistoryCoreIntent(preferenceTerms) || coreTerms.some((term) => /历史|文化/.test(term))) {
+    queries.push(`${city} 历史文化 景点`);
+  }
+  queries.push(`${city} 博物馆`);
+  queries.push(`${city} 公园`);
+  queries.push(`${city} 历史街区`);
+  queries.push(`${city} 地标`);
+  if (input.hasExplicitTravelPreferences !== true && coreTerms.length === 0) {
     for (const label of rotateClassicCityLabels(input.day.dayNumber)) {
       if (label === '城市漫步') {
         continue;
       }
-      queries.push(`${input.destination} ${label}`);
+      queries.push(`${city}${label}`);
     }
   }
   return uniqueQueries(queries);
@@ -133,10 +218,11 @@ export function coreCompletionQueries(input: {
 export function dayNeedsCorePlaceCompletion(
   day: ResolvedTripPlanDay,
   pace?: TripPace,
+  targetCorePlacesPerDay?: 2 | 3,
 ): boolean {
   const cores = day.stops.filter((stop) => isCoreStop(stop));
-  const resolvedPace = resolveTripPace(pace);
-  if (resolvedPace === 'relaxed') {
+  const target = targetCorePlacesPerDay ?? (resolveTripPace(pace) === 'relaxed' ? 2 : 3);
+  if (target <= 2) {
     return cores.length < 2;
   }
   if (cores.length >= 3) {
@@ -151,6 +237,14 @@ export function dayNeedsCorePlaceCompletion(
   return true;
 }
 
+function targetCoreCount(pace?: TripPace, policy?: PlanningPolicyV1): 2 | 3 {
+  return policy?.targetCorePlacesPerDay ?? (resolveTripPace(pace) === 'relaxed' ? 2 : 3);
+}
+
+function maxCoreDistance(policy?: PlanningPolicyV1): number {
+  return policy?.maxCoreAreaDistanceMeters ?? CORE_COMPLETION_MAX_DISTANCE_METERS;
+}
+
 function rankCandidates(
   candidates: readonly Place[],
   suggestion: TripPlaceSuggestion,
@@ -158,6 +252,7 @@ function rankCandidates(
   dayTitle: string,
   cores: readonly ResolvedTripPlaceStop[],
   city: string,
+  maxDistanceMeters: number,
 ): Place[] {
   const anchors = cores.map((stop) => stop.place);
   const eligible = filterEligibleTripPlaces(candidates, suggestion)
@@ -166,7 +261,7 @@ function rankCandidates(
       && !isRejectedCategory(place)
       && isFiniteGeoPoint(place)
       && (place.category === 'attraction' || place.category === 'activity')
-      && distanceScore(place, anchors) <= CORE_COMPLETION_MAX_DISTANCE_METERS
+      && distanceScore(place, anchors) <= maxDistanceMeters
     ));
   return [...eligible].sort((left, right) => {
     const association = associationScore(left, dayTitle, cores) - associationScore(right, dayTitle, cores);
@@ -216,39 +311,56 @@ export async function completeResolvedTripCorePlaces(input: {
   plan: ResolvedTripPlanSuggestion;
   destination: string;
   pace?: TripPace;
+  policy?: PlanningPolicyV1;
   placeSearch: PlaceSearchService;
   hasExplicitTravelPreferences?: boolean;
   preferenceTerms?: readonly string[];
   signal?: AbortSignal;
+  scoringContext?: {
+    profileSignals?: TravelProfileSignals;
+    tripIntent?: TripIntentV1;
+    partyContext?: PartyContextV1;
+    constraints?: TripConstraintsV1;
+  };
 }): Promise<ResolvedTripPlanSuggestion> {
   const used = new Set(input.plan.days.flatMap((day) => day.stops.map((stop) => stop.place.id)));
   const cache = new Map<string, Place[]>();
-  const days: ResolvedTripPlanDay[] = [];
+  const completedByNumber = new Map<number, ResolvedTripPlanDay>();
+  const previousDayCoreStops: Array<{ dayNumber: number; place: Place }> = [];
+  const target = targetCoreCount(input.pace, input.policy);
+  const maxDistance = maxCoreDistance(input.policy);
+  const orderedDays = [...input.plan.days].sort((left, right) => left.dayNumber - right.dayNumber);
 
-  for (const day of input.plan.days) {
+  for (const day of orderedDays) {
     const nextStops = day.stops.map((stop) => ({
       ...stop,
       place: { ...stop.place },
     }));
-    if (!dayNeedsCorePlaceCompletion({ ...day, stops: nextStops }, input.pace)) {
-      days.push({ ...day, stops: nextStops });
+    if (!dayNeedsCorePlaceCompletion({ ...day, stops: nextStops }, input.pace, target)) {
+      const finished = { ...day, stops: nextStops };
+      completedByNumber.set(day.dayNumber, finished);
+      for (const stop of nextStops.filter((item) => isCoreStop(item))) {
+        previousDayCoreStops.push({ dayNumber: day.dayNumber, place: stop.place });
+      }
       continue;
     }
+    const originalCores = nextStops.filter((stop) => isCoreStop(stop));
     const missing = Math.max(
       0,
-      (resolveTripPace(input.pace) === 'relaxed' ? 2 : 3) - nextStops.filter((stop) => isCoreStop(stop)).length,
+      target - originalCores.length,
     );
     const queries = coreCompletionQueries({
       destination: input.destination,
       day,
-      cores: nextStops.filter((stop) => isCoreStop(stop)),
+      cores: originalCores,
       preferenceTerms: input.preferenceTerms,
       hasExplicitTravelPreferences: input.hasExplicitTravelPreferences,
     });
     let searches = 0;
     const searchBudget = missing * CORE_COMPLETION_SEARCHES_PER_MISSING;
+    const daySlots: CoreCompletionSlotSnapshotV1[] = [];
     for (const query of queries) {
-      if (nextStops.filter((stop) => isCoreStop(stop)).length >= (resolveTripPace(input.pace) === 'relaxed' ? 2 : 3)) {
+      if (nextStops.filter((stop) => isCoreStop(stop)).length >= target) {
         break;
       }
       if (searches >= searchBudget) {
@@ -257,17 +369,101 @@ export async function completeResolvedTripCorePlaces(input: {
       searches += 1;
       const suggestion = sightSuggestion(query);
       const found = await searchOnce(cache, input.placeSearch, query, input.destination, input.signal);
-      const ranked = rankCandidates(
+      const cores = nextStops.filter((stop) => isCoreStop(stop));
+      const legacyRanked = rankCandidates(
         found,
         suggestion,
         used,
         day.title,
-        nextStops.filter((stop) => isCoreStop(stop)),
+        cores,
         input.destination,
+        maxDistance,
       );
-      const picked = ranked[0];
-      if (!picked) {
+      const rankingContext = {
+        usedPlaceIds: used,
+        anchors: cores.map((stop) => stop.place),
+        policy: input.policy,
+        profileSignals: input.scoringContext?.profileSignals,
+        tripIntent: input.scoringContext?.tripIntent,
+        partyContext: input.scoringContext?.partyContext,
+        constraints: input.scoringContext?.constraints,
+        existingCoreStops: cores.map((stop) => stop.place),
+        existingResolvedCores: cores.map((stop) => ({
+          place: stop.place,
+          suggestedDurationMinutes: stop.suggestedDurationMinutes,
+        })),
+        previousDayCoreStops: previousDayCoreStops.map((stop) => ({
+          dayNumber: stop.dayNumber,
+          place: stop.place,
+        })),
+        queryText: suggestion.query,
+      };
+      const ranked = input.scoringContext
+        ? rerankCoreCompletionCandidatesV1(legacyRanked, rankingContext)
+        : legacyRanked;
+      const baseline = ranked[0];
+      runCoreCombinationSnapshotShadowV1(() => {
+        if (!baseline || daySlots.length >= 2) {
+          return;
+        }
+        daySlots.push({
+          dayNumber: day.dayNumber,
+          slotIndex: daySlots.length,
+          candidates: snapshotCoreCompletionCandidatesV1(
+            ranked,
+            legacyRanked,
+            input.scoringContext ? rankingContext : undefined,
+          ),
+        });
+      });
+      if (!baseline) {
         continue;
+      }
+      let picked = baseline;
+      if (input.scoringContext && missing === 1) {
+        try {
+          const snapshots = snapshotCoreCompletionCandidatesV1(
+            ranked,
+            legacyRanked,
+            rankingContext,
+          );
+          const scheduled: CanaryCoreCompletionCandidateV1[] = snapshots.map((item, rerankIndex) => ({
+            place: item.place,
+            preRouteScore: scorePreRouteCoreCombinationV1({
+              dayNumber: day.dayNumber,
+              originalCores,
+              comboPlaces: [item.place],
+              policy: input.policy,
+              profileSignals: input.scoringContext?.profileSignals,
+              tripIntent: input.scoringContext?.tripIntent,
+              partyContext: input.scoringContext?.partyContext,
+              constraints: input.scoringContext?.constraints,
+              previousDayCoreStops,
+            }),
+            suggestedStartTime: '15:30',
+            suggestedDurationMinutes: resolveStopDuration({
+              place: item.place,
+              suggestionCategory: 'sight',
+              pace: input.pace,
+              destination: input.destination,
+            }).suggestedDurationMinutes,
+            rerankIndex,
+          }));
+          const baselineScheduled = scheduled.find((item) => item.place.id === baseline.id);
+          if (baselineScheduled) {
+            picked = selectCanaryCoreCompletionCandidateV1({
+              baseline: baselineScheduled,
+              alternatives: scheduled.filter((item) => item.place.id !== baseline.id),
+              missingCoreCount: missing,
+              scoringContext: input.scoringContext,
+            }) ?? baseline;
+          }
+        } catch {
+          picked = baseline;
+        }
+      }
+      if (!picked) {
+        picked = baseline;
       }
       used.add(picked.id);
       const duration = resolveStopDuration({
@@ -286,18 +482,42 @@ export async function completeResolvedTripCorePlaces(input: {
         resolutionSource: 'DAY_FALLBACK_MATCH',
       });
     }
-    days.push({
+    runCoreCombinationSnapshotShadowV1(() => {
+      const snapshot = scoreDayCoreCombinationSnapshotV1({
+        dayNumber: day.dayNumber,
+        slots: daySlots,
+        originalCores,
+        policy: input.policy,
+        profileSignals: input.scoringContext?.profileSignals,
+        tripIntent: input.scoringContext?.tripIntent,
+        partyContext: input.scoringContext?.partyContext,
+        constraints: input.scoringContext?.constraints,
+        previousDayCoreStops,
+      });
+      void snapshot;
+    });
+    const finished = {
       dayNumber: day.dayNumber,
       title: day.title,
       summary: day.summary,
       stops: nextStops,
-    });
+    };
+    completedByNumber.set(day.dayNumber, finished);
+    for (const stop of nextStops.filter((item) => isCoreStop(item))) {
+      previousDayCoreStops.push({ dayNumber: day.dayNumber, place: stop.place });
+    }
   }
 
   return {
     title: input.plan.title,
     summary: input.plan.summary,
     unresolved: input.plan.unresolved.map((item) => ({ ...item })),
-    days,
+    days: input.plan.days.map((day) => {
+      const finished = completedByNumber.get(day.dayNumber);
+      return finished ?? {
+        ...day,
+        stops: day.stops.map((stop) => ({ ...stop, place: { ...stop.place } })),
+      };
+    }),
   };
 }

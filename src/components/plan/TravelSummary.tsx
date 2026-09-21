@@ -2,6 +2,7 @@ import { FormEvent, useState, type ReactNode } from 'react';
 import type { TripRequirementDraft } from '../../domain/trip/ai';
 import type { TripPace } from '../../domain/trip/types';
 import { formatSummaryEditIntent } from '../../services/plan-conversation-service';
+import { tripContextChips } from '../../services/plan-conversation-display';
 
 const PACE_LABEL: Record<TripPace, string> = {
   relaxed: '轻松',
@@ -32,6 +33,7 @@ export function TravelSummary({
   onDraftCommit: (draft: TripRequirementDraft, intentMessage: string) => void;
 }) {
   const [editing, setEditing] = useState<keyof TripRequirementDraft | 'preferences' | null>(null);
+  const chips = tripContextChips(draft);
 
   function commit(next: TripRequirementDraft, field: keyof TripRequirementDraft | 'preferences') {
     onDraftCommit(next, formatSummaryEditIntent(field, next));
@@ -51,150 +53,169 @@ export function TravelSummary({
     <aside className="travel-summary">
       <p className="eyebrow">本次旅行{complete ? ' · 信息已齐全' : ''}</p>
       <h2>旅行信息</h2>
-      <SummaryRow
-        label="目的地"
-        value={displayValue(draft.destination)}
-        editing={editing === 'destination'}
-        onEdit={() => setEditing('destination')}
-        onCancel={() => setEditing(null)}
-        locked={locked}
-      >
-        <form onSubmit={(event) => submitField(event, 'destination', {
-          ...draft,
-          destination: String(new FormData(event.currentTarget).get('value') ?? '').trim() || undefined,
-        })}>
-          <input name="value" defaultValue={draft.destination ?? ''} />
-          <button type="submit">保存</button>
-        </form>
-      </SummaryRow>
-      <SummaryRow
-        label="出发地"
-        value={displayValue(draft.origin)}
-        editing={editing === 'origin'}
-        onEdit={() => setEditing('origin')}
-        onCancel={() => setEditing(null)}
-        locked={locked}
-      >
-        <form onSubmit={(event) => submitField(event, 'origin', {
-          ...draft,
-          origin: String(new FormData(event.currentTarget).get('value') ?? '').trim() || undefined,
-        })}>
-          <input name="value" defaultValue={draft.origin ?? ''} />
-          <button type="submit">保存</button>
-        </form>
-      </SummaryRow>
-      <SummaryRow
-        label="日期"
-        value={draft.startDate || draft.endDate
-          ? `${displayValue(draft.startDate, '未定')} — ${displayValue(draft.endDate, '未定')}`
-          : '待补充'}
-        editing={editing === 'startDate'}
-        onEdit={() => setEditing('startDate')}
-        onCancel={() => setEditing(null)}
-        locked={locked}
-      >
-        <form onSubmit={(event) => {
-          const data = new FormData(event.currentTarget);
-          submitField(event, 'startDate', {
+
+      <section className="travel-summary__group" aria-label="基础信息">
+        <h3>基础信息</h3>
+        <SummaryRow
+          label="目的地"
+          value={displayValue(draft.destination)}
+          editing={editing === 'destination'}
+          onEdit={() => setEditing('destination')}
+          onCancel={() => setEditing(null)}
+          locked={locked}
+        >
+          <form onSubmit={(event) => submitField(event, 'destination', {
             ...draft,
-            startDate: String(data.get('start') ?? '') || undefined,
-            endDate: String(data.get('end') ?? '') || undefined,
-          });
-        }}>
-          <input type="date" name="start" defaultValue={draft.startDate ?? ''} />
-          <input type="date" name="end" defaultValue={draft.endDate ?? ''} />
-          <button type="submit">保存</button>
-        </form>
-      </SummaryRow>
-      <SummaryRow
-        label="天数"
-        value={draft.durationDays ? `${draft.durationDays} 天` : '待补充'}
-        editing={editing === 'durationDays'}
-        onEdit={() => setEditing('durationDays')}
-        onCancel={() => setEditing(null)}
-        locked={locked}
-      >
-        <form onSubmit={(event) => submitField(event, 'durationDays', {
-          ...draft,
-          durationDays: Number(new FormData(event.currentTarget).get('value')) || undefined,
-        })}>
-          <input type="number" min="1" name="value" defaultValue={draft.durationDays ?? ''} />
-          <button type="submit">保存</button>
-        </form>
-      </SummaryRow>
-      <SummaryRow
-        label="人数"
-        value={draft.travelerCount ? `${draft.travelerCount} 人` : '待补充'}
-        editing={editing === 'travelerCount'}
-        onEdit={() => setEditing('travelerCount')}
-        onCancel={() => setEditing(null)}
-        locked={locked}
-      >
-        <form onSubmit={(event) => submitField(event, 'travelerCount', {
-          ...draft,
-          travelerCount: Number(new FormData(event.currentTarget).get('value')) || undefined,
-        })}>
-          <input type="number" min="1" name="value" defaultValue={draft.travelerCount ?? ''} />
-          <button type="submit">保存</button>
-        </form>
-      </SummaryRow>
-      <SummaryRow
-        label="总预算"
-        value={draft.totalBudget ? `¥${draft.totalBudget.toLocaleString('zh-CN')}` : '待补充'}
-        editing={editing === 'totalBudget'}
-        onEdit={() => setEditing('totalBudget')}
-        onCancel={() => setEditing(null)}
-        locked={locked}
-      >
-        <form onSubmit={(event) => submitField(event, 'totalBudget', {
-          ...draft,
-          totalBudget: Number(new FormData(event.currentTarget).get('value')) || undefined,
-        })}>
-          <input type="number" min="1" name="value" defaultValue={draft.totalBudget ?? ''} />
-          <button type="submit">保存</button>
-        </form>
-      </SummaryRow>
-      <SummaryRow
-        label="节奏"
-        value={draft.pace ? PACE_LABEL[draft.pace] : '待补充'}
-        editing={editing === 'pace'}
-        onEdit={() => setEditing('pace')}
-        onCancel={() => setEditing(null)}
-        locked={locked}
-      >
-        <form onSubmit={(event) => submitField(event, 'pace', {
-          ...draft,
-          pace: String(new FormData(event.currentTarget).get('value')) as TripPace,
-        })}>
-          <select name="value" defaultValue={draft.pace ?? 'balanced'}>
-            <option value="relaxed">轻松</option>
-            <option value="balanced">均衡</option>
-            <option value="packed">紧凑</option>
-          </select>
-          <button type="submit">保存</button>
-        </form>
-      </SummaryRow>
-      <SummaryRow
-        label="兴趣"
-        value={draft.preferences?.interests?.length
-          ? draft.preferences.interests.join('、')
-          : '待补充'}
-        editing={editing === 'preferences'}
-        onEdit={() => setEditing('preferences')}
-        onCancel={() => setEditing(null)}
-        locked={locked}
-      >
-        <form onSubmit={(event) => submitField(event, 'preferences', {
-          ...draft,
-          preferences: {
-            ...draft.preferences,
-            interests: splitList(String(new FormData(event.currentTarget).get('value') ?? '')),
-          },
-        })}>
-          <input name="value" defaultValue={draft.preferences?.interests.join('，') ?? ''} />
-          <button type="submit">保存</button>
-        </form>
-      </SummaryRow>
+            destination: String(new FormData(event.currentTarget).get('value') ?? '').trim() || undefined,
+          })}>
+            <input name="value" defaultValue={draft.destination ?? ''} />
+            <button type="submit">保存</button>
+          </form>
+        </SummaryRow>
+        <SummaryRow
+          label="出发地"
+          value={displayValue(draft.origin)}
+          editing={editing === 'origin'}
+          onEdit={() => setEditing('origin')}
+          onCancel={() => setEditing(null)}
+          locked={locked}
+        >
+          <form onSubmit={(event) => submitField(event, 'origin', {
+            ...draft,
+            origin: String(new FormData(event.currentTarget).get('value') ?? '').trim() || undefined,
+          })}>
+            <input name="value" defaultValue={draft.origin ?? ''} />
+            <button type="submit">保存</button>
+          </form>
+        </SummaryRow>
+        <SummaryRow
+          label="日期"
+          value={draft.startDate || draft.endDate
+            ? `${displayValue(draft.startDate, '未定')} — ${displayValue(draft.endDate, '未定')}`
+            : '待补充'}
+          editing={editing === 'startDate'}
+          onEdit={() => setEditing('startDate')}
+          onCancel={() => setEditing(null)}
+          locked={locked}
+        >
+          <form onSubmit={(event) => {
+            const data = new FormData(event.currentTarget);
+            submitField(event, 'startDate', {
+              ...draft,
+              startDate: String(data.get('start') ?? '') || undefined,
+              endDate: String(data.get('end') ?? '') || undefined,
+            });
+          }}>
+            <input type="date" name="start" defaultValue={draft.startDate ?? ''} />
+            <input type="date" name="end" defaultValue={draft.endDate ?? ''} />
+            <button type="submit">保存</button>
+          </form>
+        </SummaryRow>
+        <SummaryRow
+          label="天数"
+          value={draft.durationDays ? `${draft.durationDays} 天` : '待补充'}
+          editing={editing === 'durationDays'}
+          onEdit={() => setEditing('durationDays')}
+          onCancel={() => setEditing(null)}
+          locked={locked}
+        >
+          <form onSubmit={(event) => submitField(event, 'durationDays', {
+            ...draft,
+            durationDays: Number(new FormData(event.currentTarget).get('value')) || undefined,
+          })}>
+            <input type="number" min="1" name="value" defaultValue={draft.durationDays ?? ''} />
+            <button type="submit">保存</button>
+          </form>
+        </SummaryRow>
+        <SummaryRow
+          label="人数"
+          value={draft.travelerCount ? `${draft.travelerCount} 人` : '待补充'}
+          editing={editing === 'travelerCount'}
+          onEdit={() => setEditing('travelerCount')}
+          onCancel={() => setEditing(null)}
+          locked={locked}
+        >
+          <form onSubmit={(event) => submitField(event, 'travelerCount', {
+            ...draft,
+            travelerCount: Number(new FormData(event.currentTarget).get('value')) || undefined,
+          })}>
+            <input type="number" min="1" name="value" defaultValue={draft.travelerCount ?? ''} />
+            <button type="submit">保存</button>
+          </form>
+        </SummaryRow>
+        <SummaryRow
+          label="总预算"
+          value={draft.totalBudget ? `¥${draft.totalBudget.toLocaleString('zh-CN')}` : '待补充'}
+          editing={editing === 'totalBudget'}
+          onEdit={() => setEditing('totalBudget')}
+          onCancel={() => setEditing(null)}
+          locked={locked}
+        >
+          <form onSubmit={(event) => submitField(event, 'totalBudget', {
+            ...draft,
+            totalBudget: Number(new FormData(event.currentTarget).get('value')) || undefined,
+          })}>
+            <input type="number" min="1" name="value" defaultValue={draft.totalBudget ?? ''} />
+            <button type="submit">保存</button>
+          </form>
+        </SummaryRow>
+      </section>
+
+      <section className="travel-summary__group" aria-label="旅行方式">
+        <h3>旅行方式</h3>
+        <SummaryRow
+          label="节奏"
+          value={draft.pace ? PACE_LABEL[draft.pace] : '待补充'}
+          editing={editing === 'pace'}
+          onEdit={() => setEditing('pace')}
+          onCancel={() => setEditing(null)}
+          locked={locked}
+        >
+          <form onSubmit={(event) => submitField(event, 'pace', {
+            ...draft,
+            pace: String(new FormData(event.currentTarget).get('value')) as TripPace,
+          })}>
+            <select name="value" defaultValue={draft.pace ?? 'balanced'}>
+              <option value="relaxed">轻松</option>
+              <option value="balanced">均衡</option>
+              <option value="packed">紧凑</option>
+            </select>
+            <button type="submit">保存</button>
+          </form>
+        </SummaryRow>
+        <SummaryRow
+          label="兴趣"
+          value={draft.preferences?.interests?.length
+            ? draft.preferences.interests.join('、')
+            : '待补充'}
+          editing={editing === 'preferences'}
+          onEdit={() => setEditing('preferences')}
+          onCancel={() => setEditing(null)}
+          locked={locked}
+        >
+          <form onSubmit={(event) => submitField(event, 'preferences', {
+            ...draft,
+            preferences: {
+              ...draft.preferences,
+              interests: splitList(String(new FormData(event.currentTarget).get('value') ?? '')),
+            },
+          })}>
+            <input name="value" defaultValue={draft.preferences?.interests.join('，') ?? ''} />
+            <button type="submit">保存</button>
+          </form>
+        </SummaryRow>
+      </section>
+
+      {chips.length > 0 && (
+        <section className="travel-summary__group" aria-label="本次同行与约束">
+          <h3>本次同行与约束</h3>
+          <ul className="travel-summary__chips">
+            {chips.map((chip) => (
+              <li key={chip}>{chip}</li>
+            ))}
+          </ul>
+        </section>
+      )}
     </aside>
   );
 }

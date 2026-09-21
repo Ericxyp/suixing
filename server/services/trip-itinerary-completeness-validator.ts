@@ -18,6 +18,7 @@ export type ItineraryCompletenessReason =
 
 export interface ItineraryCompletenessInput {
   pace?: TripPace;
+  targetCorePlacesPerDay?: 2 | 3;
   placeIds: ReadonlySet<string>;
   corePlaceCount: number;
   items: readonly TripScheduleItem[];
@@ -132,24 +133,83 @@ export function isValidTwoCorePlaceDowngrade(input: {
   return true;
 }
 
-export function targetCorePlaceCount(pace?: TripPace): number {
+export function targetCorePlaceCount(pace?: TripPace, targetCorePlacesPerDay?: 2 | 3): number {
+  if (resolveTripPace(pace) === 'packed') {
+    return 3;
+  }
+  if (targetCorePlacesPerDay === 2 || targetCorePlacesPerDay === 3) {
+    return targetCorePlacesPerDay;
+  }
   return resolveTripPace(pace) === 'relaxed' ? 2 : 3;
+}
+
+function sortedItems(items: readonly TripScheduleItem[]): TripScheduleItem[] {
+  return [...items].sort((left, right) => (
+    (parseClock(left.startTime) ?? 0) - (parseClock(right.startTime) ?? 0)
+  ));
+}
+
+function hasLunchCoverage(items: readonly TripScheduleItem[]): boolean {
+  const lunchMeals = items.filter((item) => isMealArrangement(item, 'lunch'));
+  const lunchRests = items.filter((item) => (
+    item.kind === 'rest' && covers(item, 11 * 60 + 30, 14 * 60)
+  ));
+  return lunchMeals.length > 0 || lunchRests.length > 0
+    || items.some((item) => item.kind === 'meal' && covers(item, 11 * 60, 16 * 60 + 30));
+}
+
+function hasScheduleDefect(items: readonly TripScheduleItem[]): boolean {
+  for (let index = 0; index < items.length - 1; index += 1) {
+    const end = itemEnd(items[index]);
+    const nextStart = parseClock(items[index + 1].startTime);
+    if (end === undefined || nextStart === undefined) {
+      return true;
+    }
+    if (nextStart < end || items[index].startTime === items[index + 1].startTime) {
+      return true;
+    }
+    if (nextStart - end > MAX_GAP) {
+      return true;
+    }
+  }
+  return items.some((item) => item.kind === 'rest' && item.durationMinutes > 45);
+}
+
+export function isValidPolicyTwoCoreDay(input: ItineraryCompletenessInput): boolean {
+  if (input.targetCorePlacesPerDay !== 2 || resolveTripPace(input.pace) === 'packed') {
+    return false;
+  }
+  if (input.corePlaceCount !== 2) {
+    return false;
+  }
+  const items = sortedItems(input.items);
+  if (items.length === 0 || items.some((item) => isGeneric(item) && input.allowUserFreeTime !== true)) {
+    return false;
+  }
+  if (!hasLunchCoverage(items) || hasScheduleDefect(items)) {
+    return false;
+  }
+  const lastEnd = items.length ? itemEnd(items[items.length - 1]) : undefined;
+  return lastEnd !== undefined && lastEnd >= 16 * 60 + 30;
+}
+
+function isMealArrangement(
+  item: TripScheduleItem,
+  period: 'lunch' | 'dinner',
+): boolean {
+  return (item.kind === 'meal' || item.kind === 'meal_place' || item.kind === 'meal_slot')
+    && item.mealPeriod === period;
 }
 
 export function validateDayItineraryCompleteness(
   input: ItineraryCompletenessInput,
 ): ItineraryCompletenessResult {
   const pace = resolveTripPace(input.pace);
-  const items = [...input.items].sort((left, right) => {
-    return (parseClock(left.startTime) ?? 0) - (parseClock(right.startTime) ?? 0);
-  });
+  const items = sortedItems(input.items);
   if (input.corePlaceCount < 2) {
     return { valid: false, reason: 'MISSING_CORE_PLACES' };
   }
-  const lunchMeals = items.filter((item) => (
-    (item.kind === 'meal' || item.kind === 'meal_place' || item.kind === 'meal_slot')
-    && item.mealPeriod === 'lunch'
-  ));
+  const lunchMeals = items.filter((item) => isMealArrangement(item, 'lunch'));
   const lunchRests = items.filter((item) => (
     item.kind === 'rest' && covers(item, 11 * 60 + 30, 14 * 60)
   ));
@@ -193,14 +253,13 @@ export function validateDayItineraryCompleteness(
       return { valid: false, reason: 'UNEXPLAINED_GAP' };
     }
   }
-  const hasLunch = lunchMeals.length > 0 || lunchRests.length > 0
-    || items.some((item) => item.kind === 'meal' && covers(item, 11 * 60, 16 * 60 + 30));
-  if (!hasLunch) {
+  if (!hasLunchCoverage(items)) {
     return { valid: false, reason: 'MISSING_LUNCH' };
   }
   const last = items[items.length - 1];
   const lastEnd = last ? itemEnd(last) : undefined;
-  const minEnd = pace === 'relaxed' ? 16 * 60 + 30 : 17 * 60;
+  const policyAllowsTwoCores = input.targetCorePlacesPerDay === 2 && pace !== 'packed';
+  const minEnd = pace === 'relaxed' || policyAllowsTwoCores ? 16 * 60 + 30 : 17 * 60;
   if (lastEnd === undefined || lastEnd < 11 * 60) {
     return { valid: false, reason: 'DAY_ENDS_TOO_EARLY' };
   }
@@ -226,7 +285,7 @@ export function validateDayItineraryCompleteness(
     return { valid: false, reason: 'UNEXPLAINED_GAP' };
   }
   const hasDinner = items.some((item) => (
-    ((item.kind === 'meal' || item.kind === 'meal_place' || item.kind === 'meal_slot') && item.mealPeriod === 'dinner')
+    isMealArrangement(item, 'dinner')
     || item.kind === 'area_walk'
     || item.kind === 'hotel_return'
     || (item.kind === 'place' && (parseClock(item.startTime) ?? 0) >= 17 * 60)
@@ -234,16 +293,21 @@ export function validateDayItineraryCompleteness(
   if (lastEnd >= 17 * 60 + 30 && !hasDinner) {
     return { valid: false, reason: 'MISSING_DINNER' };
   }
-  if (pace === 'balanced' && input.corePlaceCount < 3) {
-    if (!isValidTwoCorePlaceDowngrade(input)) {
-      return {
-        valid: false,
-        reason: input.corePlaceCount === 2 ? 'INVALID_TWO_PLACE_DAY' : 'INSUFFICIENT_CORE_PLACES',
-      };
-    }
-  }
+  const requiredCores = targetCorePlaceCount(input.pace, input.targetCorePlacesPerDay);
   if (pace === 'packed' && input.corePlaceCount < 3) {
     return { valid: false, reason: 'INSUFFICIENT_CORE_PLACES' };
+  }
+  if (requiredCores > 2 && input.corePlaceCount < requiredCores) {
+    if (pace === 'balanced' && isValidTwoCorePlaceDowngrade(input)) {
+      return { valid: true };
+    }
+    if (isValidPolicyTwoCoreDay(input)) {
+      return { valid: true };
+    }
+    return {
+      valid: false,
+      reason: input.corePlaceCount === 2 ? 'INVALID_TWO_PLACE_DAY' : 'INSUFFICIENT_CORE_PLACES',
+    };
   }
   return { valid: true };
 }

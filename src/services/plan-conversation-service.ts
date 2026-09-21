@@ -4,6 +4,16 @@ import type {
   TripRequirementDraft,
 } from '../domain/trip/ai';
 import type { TripPace, TripPreference } from '../domain/trip/types';
+import {
+  TRAVEL_INTEREST_LABELS,
+  explicitProfileSignals,
+  mergePartyContext,
+  mergeProfileSignals,
+  mergeTripConstraints,
+  mergeTripIntent,
+  type TravelInterestKey,
+  type TravelProfileSignals,
+} from '../domain/trip/profile';
 import type { CreateTripInput } from '../repositories/trip-repository';
 import { BffClientError } from './bff-client';
 import type { RequirementExtractionService } from './trip-requirement-service';
@@ -150,6 +160,27 @@ function uniqueStrings(values: string[]): string[] {
   return items;
 }
 
+function applyConstraintPreferences(
+  preferences: TripPreference | undefined,
+  incoming: TripRequirementDraft['constraints'] | undefined,
+): TripPreference | undefined {
+  const excluded = incoming?.excludedInterestKeys ?? [];
+  if (excluded.length === 0) {
+    return preferences;
+  }
+  const avoidLabels = excluded.flatMap((key) => [...TRAVEL_INTEREST_LABELS[key as TravelInterestKey]]);
+  const avoid = uniqueStrings([...(preferences?.avoid ?? []), ...avoidLabels]);
+  const blocked = new Set(avoidLabels.map((item) => item.toLowerCase()));
+  const interests = (preferences?.interests ?? []).filter((item) => !blocked.has(item.trim().toLowerCase()));
+  const next: TripPreference = {
+    interests,
+    ...(preferences?.accommodation?.length ? { accommodation: preferences.accommodation } : {}),
+    ...(preferences?.mustVisit?.length ? { mustVisit: preferences.mustVisit } : {}),
+    ...(avoid.length ? { avoid } : {}),
+  };
+  return next;
+}
+
 function mergePreferences(
   previous?: TripPreference,
   incoming?: TripPreference,
@@ -193,11 +224,34 @@ export function mergeRequirementDrafts(
     travelerCount: incoming.travelerCount ?? previous.travelerCount,
     totalBudget: incoming.totalBudget ?? previous.totalBudget,
     pace: incoming.pace ?? previous.pace,
-    preferences: mergePreferences(previous.preferences, incoming.preferences),
+    diningMode: incoming.diningMode ?? previous.diningMode,
+    preferences: applyConstraintPreferences(
+      mergePreferences(previous.preferences, incoming.preferences),
+      mergeTripConstraints(previous.constraints, incoming.constraints),
+    ),
+    tripIntent: mergeTripIntent(previous.tripIntent, incoming.tripIntent),
+    partyContext: mergePartyContext(previous.partyContext, incoming.partyContext),
+    constraints: mergeTripConstraints(previous.constraints, incoming.constraints),
+    profilePatch: mergeProfilePatches(previous.profilePatch, incoming.profilePatch),
+    longTermProfileSignals: incoming.longTermProfileSignals ?? previous.longTermProfileSignals,
   };
   return Object.fromEntries(
     Object.entries(merged).filter(([, value]) => value !== undefined),
   ) as TripRequirementDraft;
+}
+
+function mergeProfilePatches(
+  previous: TripRequirementDraft['profilePatch'],
+  incoming: TripRequirementDraft['profilePatch'],
+): TripRequirementDraft['profilePatch'] | undefined {
+  const signals = mergeProfileSignals(
+    previous ? explicitProfileSignals(previous.signals) : undefined,
+    incoming ? explicitProfileSignals(incoming.signals) : undefined,
+  );
+  if (Object.keys(signals).length === 0) {
+    return undefined;
+  }
+  return { signals };
 }
 
 export function createPlanMessage(
@@ -351,6 +405,17 @@ export function applySummaryDraftUpdate(
   }, now);
 }
 
+export function applyTripStyleDraftUpdate(
+  state: PlanConversationState,
+  draft: TripRequirementDraft,
+): PlanConversationState {
+  return {
+    ...state,
+    draft,
+    missingRequiredFields: getMissingRequirementFields(draft),
+  };
+}
+
 function replaceLastMatchingAssistant(
   messages: PlanMessage[],
   fromContent: string,
@@ -418,11 +483,18 @@ export function toCreateTripRequirements(
   if (!isPlanReadyToGenerate(draft) || !draft.destination || !draft.travelerCount || !draft.totalBudget) {
     return undefined;
   }
+  const profileSignals = effectiveProfileSignals(draft);
   return {
     ...draft,
     destination: draft.destination.trim(),
     travelerCount: draft.travelerCount,
     totalBudget: draft.totalBudget,
     pace: draft.pace ?? 'balanced',
+    ...(profileSignals ? { profileSignals } : {}),
   };
+}
+
+export function effectiveProfileSignals(draft: TripRequirementDraft): TravelProfileSignals | undefined {
+  const merged = mergeProfileSignals(draft.longTermProfileSignals, draft.profilePatch?.signals);
+  return Object.keys(merged).length > 0 ? merged : undefined;
 }

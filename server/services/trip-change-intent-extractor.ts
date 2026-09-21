@@ -73,9 +73,15 @@ export interface TripChangeContext {
   days: TripChangeContextDay[];
 }
 
+export interface TripChangeFocus {
+  selectedDayNumber?: number;
+  sourceTripPlaceId?: string;
+}
+
 export interface TripChangeInterpretRequest {
   input: string;
   context: TripChangeContext;
+  focus?: TripChangeFocus;
 }
 
 export interface TripChangeIntentExtractor {
@@ -115,7 +121,8 @@ const PLACE_TYPES = new Set<TripPlaceType>([
   'shopping',
   'activity',
 ]);
-const BODY_KEYS = ['input', 'context'] as const;
+const BODY_KEYS = ['input', 'context', 'focus'] as const;
+const FOCUS_KEYS = ['selectedDayNumber', 'sourceTripPlaceId'] as const;
 const CONTEXT_KEYS = ['tripId', 'destination', 'days'] as const;
 const DAY_KEYS = ['dayNumber', 'stops'] as const;
 const STOP_KEYS = ['tripPlaceId', 'placeName', 'type', 'startTime'] as const;
@@ -190,14 +197,17 @@ export const TRIP_CHANGE_INTENT_JSON_SCHEMA: AiJsonSchema = {
 
 export const TRIP_CHANGE_INTENT_SYSTEM_PROMPT = [
   '你是中国大陆境内自由行行程修改意图提取器，只输出符合 JSON Schema 的 JSON。',
-  '只依据用户修改文本和可见行程地点，判断用户是否要把某一个现有地点替换成另一个地点。',
+  '只依据用户修改文本和可见行程地点，判断用户要把某一个现有地点换成另一个地点，或换成某一类场所。',
   '本阶段只允许 REPLACE_PLACE。ready 时 operations 最多 1 条。',
   'targetTripPlaceId 必须精确复制上下文中已有的标识，不得编造。',
   '不得输出 Place ID、坐标、路线、预算、营业时间或价格。',
   '若用户明确写出要换成的地点名称，即使带有“附近”，且该名称未出现在其他日期，必须输出 status=ready 的一条 REPLACE_PLACE。',
   'replacementQuery 只保留可检索的核心地名，去掉“附近”。',
   '示例：第二天不要去长城、换成圆明园附近 → REPLACE_PLACE，target 为第二天长城对应 tripPlaceId，replacementQuery 为圆明园。',
+  '若用户要把某地点换成商场、博物馆、咖啡馆、公园等类别，不要要求具体店名；status=ready，replacementQuery 只写类别词如商场、博物馆、咖啡馆、公园。',
+  '若用户只要附近候选、尚未指定换成哪一个，也输出 ready，replacementQuery 为类别词。',
   '若用户要把某地点换成上下文里其他日期已经出现的同名地点，必须 needs_clarification，operations 为空。',
+  '来源地点不明确时，summary 必须点出当天真实地点名称来提问，不要只说请提供具体名称。',
   '无法确定目标、编造 ID、一次改多处、或把第二天都重排、轻松一点、改预算、改日期、增删地点、跨天移动、排序、预订时：',
   'status 为 needs_clarification，operations 必须为空数组，summary 用简短中文提问。',
   'summary 最长 120 字，用中文说明打算怎么改，不要写成已经改完，也不要写技术字段。',
@@ -338,9 +348,42 @@ export function parseTripChangeContext(value: unknown): TripChangeContext {
   };
 }
 
+function parseFocus(value: unknown): TripChangeFocus | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!isRecord(value) || containsProtectedKey(value)) {
+    invalidRequest();
+  }
+  const extra = Object.keys(value).filter((key) => (
+    !FOCUS_KEYS.includes(key as typeof FOCUS_KEYS[number])
+  ));
+  if (extra.length > 0) {
+    invalidRequest();
+  }
+  const focus: TripChangeFocus = {};
+  if ('selectedDayNumber' in value) {
+    if (typeof value.selectedDayNumber !== 'number' || !Number.isInteger(value.selectedDayNumber) || value.selectedDayNumber < 1) {
+      invalidRequest();
+    }
+    focus.selectedDayNumber = value.selectedDayNumber;
+  }
+  if ('sourceTripPlaceId' in value) {
+    focus.sourceTripPlaceId = readId(value.sourceTripPlaceId);
+  }
+  return focus;
+}
+
 export function parseTripChangeInterpretBody(body: unknown): TripChangeInterpretRequest | undefined {
   try {
-    if (!isRecord(body) || containsProtectedKey(body) || !hasExactKeys(body, BODY_KEYS)) {
+    if (!isRecord(body) || containsProtectedKey(body)) {
+      return undefined;
+    }
+    const keys = Object.keys(body);
+    if (!keys.includes('input') || !keys.includes('context')) {
+      return undefined;
+    }
+    if (keys.some((key) => !BODY_KEYS.includes(key as typeof BODY_KEYS[number]))) {
       return undefined;
     }
     if (typeof body.input !== 'string') {
@@ -350,9 +393,11 @@ export function parseTripChangeInterpretBody(body: unknown): TripChangeInterpret
     if (input === '' || body.input.length > TRIP_CHANGE_MAX_INPUT_LENGTH) {
       return undefined;
     }
+    const focus = parseFocus(body.focus);
     return {
       input,
       context: parseTripChangeContext(body.context),
+      ...(focus ? { focus } : {}),
     };
   } catch (error) {
     if (error instanceof AiProviderError && error.code === 'AI_INVALID_REQUEST') {
@@ -360,6 +405,14 @@ export function parseTripChangeInterpretBody(body: unknown): TripChangeInterpret
     }
     throw error;
   }
+}
+
+export function normalizeTripChangeUtterance(value: string): string {
+  return value
+    .normalize('NFKC')
+    .replace(/[\u3000]/g, ' ')
+    .replace(/[，,。.!！?？、；;：:]/g, ' ')
+    .replace(/\s+/g, '');
 }
 
 export function normalizeTripChangePlaceName(value: string): string {

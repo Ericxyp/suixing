@@ -224,6 +224,7 @@ class FakePlaceSearch implements PlaceSearchService {
 
 class FakeBuilder implements TripBuilder {
   calls = 0;
+  lastPlanningPolicy: { targetCorePlacesPerDay?: 2 | 3 } | undefined;
 
   constructor(private readonly handler: () => TripBuildResult = () => ({
     trip: fakeTrip('trip-fixed'),
@@ -231,8 +232,9 @@ class FakeBuilder implements TripBuilder {
     diagnostics: { unresolvedPlacesCount: 0, unresolvedRoutesCount: 0 },
   })) {}
 
-  build(): TripBuildResult {
+  build(input: { planningPolicy?: { targetCorePlacesPerDay?: 2 | 3 } }): TripBuildResult {
     this.calls += 1;
+    this.lastPlanningPolicy = input.planningPolicy;
     stages.push('build');
     return this.handler();
   }
@@ -282,6 +284,28 @@ function orchestrator(
   };
 }
 
+test('parents low-walking policy is passed to the trip builder', async () => {
+  const build = new FakeBuilder();
+  const { subject } = orchestrator({ build });
+  await subject.generate({
+    requirement: {
+      ...requirement,
+      destination: '北京',
+      travelerCount: 3,
+      pace: 'balanced',
+      partyContext: {
+        partyType: 'parents',
+        hasElderly: true,
+        mobilityRequirement: 'low_walking',
+      },
+      constraints: { excludedInterestKeys: [], lowWalking: true },
+    },
+    tripId: 'trip-fixed',
+    createdAt: '2026-09-16T00:00:00.000Z',
+  });
+  assert.equal(build.lastPlanningPolicy?.targetCorePlacesPerDay, 2);
+});
+
 test('runs plan, resolve, enrich and build in order and returns diagnostics', async () => {
   stages.length = 0;
   const { subject, plan, resolve, enrich, build } = orchestrator({
@@ -305,6 +329,10 @@ test('runs plan, resolve, enrich and build in order and returns diagnostics', as
   assert.equal(resolve.calls, 1);
   assert.ok(enrich.calls >= 1);
   assert.equal(build.calls, 1);
+  assert.equal(JSON.stringify(result).includes('coreCoverage'), false);
+  assert.equal(JSON.stringify(result).includes('DayCombinationScoreV1'), false);
+  assert.equal(JSON.stringify(result).includes('StyleFulfillmentAuditV1'), false);
+  assert.equal(JSON.stringify(result).includes('partially_met'), false);
 });
 
 test('records safe stage logs for the success path', async () => {
@@ -439,7 +467,9 @@ test('total budget abort cancels in-flight plan work and does not build', async 
 
 test('does not enrich or build when a day has fewer than two resolved stops', async () => {
   stages.length = 0;
+  const logs: GenerationStageLog[] = [];
   const { subject, enrich, build } = orchestrator({
+    logs,
     resolve: new FakePlaceResolver(async () => resolvedPlan([
       [stop(mappedPlace('amap:D1A', '武康路')), stop(mappedPlace('amap:D1B', '安福路'))],
       [stop(mappedPlace('amap:D2A', '外滩'))],
@@ -451,12 +481,50 @@ test('does not enrich or build when a day has fewer than two resolved stops', as
       requirement,
       tripId: 'trip-fixed',
       createdAt: '2026-09-16T00:00:00.000Z',
+      requestId: 'gplacelogs0001',
     }),
-    (error: unknown) => error instanceof TripGenerationIncompleteError,
+    (error: unknown) => {
+      assert.ok(error instanceof TripGenerationIncompleteError);
+      assert.equal(error.validationReason, 'INSUFFICIENT_CORE_PLACES');
+      return true;
+    },
   );
   assert.deepEqual(stages, ['plan', 'resolve']);
   assert.equal(enrich.calls, 0);
   assert.equal(build.calls, 0);
+  const failed = logs.find((entry) => entry.stage === 'place_resolve' && entry.outcome === 'failed');
+  assert.equal(failed?.errorCode, 'TRIP_GENERATION_INCOMPLETE');
+  assert.equal(failed?.validationReason, 'INSUFFICIENT_CORE_PLACES');
+  assert.equal(JSON.stringify(logs).includes('外滩'), false);
+  assert.equal(JSON.stringify(logs).includes('stack'), false);
+});
+
+test('place_resolve insufficient core places logs a safe validationReason', async () => {
+  const logs: GenerationStageLog[] = [];
+  const { subject } = orchestrator({
+    logs,
+    resolve: new FakePlaceResolver(async () => resolvedPlan([
+      [stop(mappedPlace('amap:D1A', '武康路'))],
+      [stop(mappedPlace('amap:D2A', '外滩')), stop(mappedPlace('amap:D2B', '豫园'))],
+      [stop(mappedPlace('amap:D3A', '人民广场')), stop(mappedPlace('amap:D3B', '豫园花园'))],
+    ])),
+  });
+  await assert.rejects(
+    () => subject.generate({
+      requirement,
+      tripId: 'trip-fixed',
+      createdAt: '2026-09-16T00:00:00.000Z',
+      requestId: 'gcorefail00001',
+    }),
+    (error: unknown) => error instanceof TripGenerationIncompleteError,
+  );
+  const failed = logs.find((entry) => entry.stage === 'place_resolve' && entry.outcome === 'failed');
+  assert.equal(failed?.errorCode, 'TRIP_GENERATION_INCOMPLETE');
+  assert.equal(failed?.validationReason, 'INSUFFICIENT_CORE_PLACES');
+  assert.deepEqual(
+    Object.keys(failed ?? {}).sort(),
+    ['durationMs', 'errorCode', 'outcome', 'requestId', 'stage', 'validationReason'],
+  );
 });
 
 test('does not call place, route or builder when the plan generator fails', async () => {

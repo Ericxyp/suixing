@@ -10,6 +10,7 @@ import {
 } from '../services/trip-change-executor';
 import {
   safeGenerationErrorCode,
+  safeGenerationValidationReason,
   type GenerationStageLogger,
 } from '../services/generation-logger';
 
@@ -57,13 +58,16 @@ export function createTripChangeApplyRouter(
 
   router.all('/trips/change/apply', async (request: Request, response: Response) => {
     const started = Date.now();
-    const log = (outcome: 'success' | 'failed', errorCode?: string) => {
+    const log = (outcome: 'success' | 'failed', error?: unknown) => {
+      const errorCode = error === undefined ? undefined : safeGenerationErrorCode(error);
+      const validationReason = error === undefined ? undefined : safeGenerationValidationReason(error);
       logger?.logStage({
         requestId: 'omitted',
         stage: 'change_apply',
         outcome,
         durationMs: Date.now() - started,
         ...(errorCode ? { errorCode } : {}),
+        ...(validationReason ? { validationReason } : {}),
       });
     };
 
@@ -84,7 +88,7 @@ export function createTripChangeApplyRouter(
     }
 
     if (!executor) {
-      log('failed', 'PROVIDER_UNAVAILABLE');
+      log('failed', { code: 'PROVIDER_UNAVAILABLE' });
       sendError(response, 503, 'PROVIDER_UNAVAILABLE', PROVIDER_UNAVAILABLE_MESSAGE);
       return;
     }
@@ -112,8 +116,7 @@ export function createTripChangeApplyRouter(
         },
       });
     } catch (error) {
-      const errorCode = safeGenerationErrorCode(error);
-      log('failed', errorCode);
+      log('failed', error);
       if (error instanceof TripChangeExecutionError) {
         if (error.code === 'INVALID_REQUEST') {
           sendError(response, 400, 'INVALID_REQUEST', TRIP_CHANGE_INVALID_REQUEST_MESSAGE);

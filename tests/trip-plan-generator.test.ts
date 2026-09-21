@@ -56,7 +56,7 @@ function day(dayNumber: number): TripPlanSuggestion['days'][number] {
     dayNumber,
     title: `第${dayNumber}日街区漫步`,
     summary: '减少跨城移动，以步行和咖啡为主。',
-    placeQueries: [place(`地点${dayNumber}甲`), place(`地点${dayNumber}乙`, 'coffee')],
+    placeQueries: [place(`地点${dayNumber}甲`), place(`地点${dayNumber}乙`, 'activity')],
   };
 }
 
@@ -130,15 +130,22 @@ test('generates a normalized plan and keeps prompt plus schema on the provider o
 
 test('prompt and schema both require two or three searchable places per day', () => {
   const schema = JSON.stringify(TRIP_PLAN_JSON_SCHEMA);
-  assert.match(TRIP_PLAN_SYSTEM_PROMPT, /每一天必须刚好提供 2 或 3 个核心地点/);
+  assert.match(TRIP_PLAN_SYSTEM_PROMPT, /每一天必须刚好提供 2 或 3 个核心参观点/);
+  assert.match(TRIP_PLAN_SYSTEM_PROMPT, /placeQueries.category 只能是 sight 或 activity/);
   assert.match(TRIP_PLAN_SYSTEM_PROMPT, /不要生成 4 个或更多地点/);
   assert.match(TRIP_PLAN_SYSTEM_PROMPT, /故宫博物院/);
   assert.match(TRIP_PLAN_SYSTEM_PROMPT, /禁止把地标、店铺和解释拼成一个 query/);
   assert.match(TRIP_PLAN_SYSTEM_PROMPT, /可被地图服务直接检索/);
-  assert.match(TRIP_PLAN_SYSTEM_PROMPT, /北京、上海、西安、成都、杭州/);
   assert.match(schema, /"minItems":2/);
   assert.match(schema, /"maxItems":3/);
   assert.match(schema, /"additionalProperties":false/);
+  assert.equal(schema.includes('"hotel"'), false);
+  assert.equal(schema.includes('"coffee"'), false);
+  assert.equal(schema.includes('"food"'), false);
+  assert.equal(schema.includes('"shopping"'), false);
+  assert.match(TRIP_PLAN_SYSTEM_PROMPT, /不要把酒店、民宿、住宿/);
+  assert.match(TRIP_PLAN_PREFERENCE_PRIORITY_PROMPT, /喜欢咖啡/);
+  assert.match(TRIP_PLAN_CLASSIC_ROUTE_PROMPT, /不要输出 category=hotel/);
 });
 
 test('empty preference lists are treated as no explicit travel preferences', () => {
@@ -219,11 +226,11 @@ test('rejects invalid model plans without leaking the raw content', () => {
   });
   const rawTime = JSON.stringify({
     ...validPlan(1),
-    days: [{ ...day(1), placeQueries: [place('武康路'), { ...place('咖啡店', 'coffee'), suggestedStartTime: '25:00' }] }],
+    days: [{ ...day(1), placeQueries: [place('武康路'), { ...place('田子坊', 'activity'), suggestedStartTime: '25:00' }] }],
   });
   const rawDuration = JSON.stringify({
     ...validPlan(1),
-    days: [{ ...day(1), placeQueries: [place('武康路'), { ...place('咖啡店', 'coffee'), suggestedDurationMinutes: 10 }] }],
+    days: [{ ...day(1), placeQueries: [place('武康路'), { ...place('田子坊', 'activity'), suggestedDurationMinutes: 10 }] }],
   });
 
   assert.throws(() => parseTripPlanSuggestion('not-json', 3), invalid);
@@ -328,11 +335,21 @@ test('classifies invalid model JSON into safe validation reasons', () => {
   }), 1, 'INVALID_CATEGORY', ['museum', '武康路']);
   assertValidationReason(JSON.stringify({
     ...validPlan(1),
-    days: [{ ...day(1), placeQueries: [place('武康路'), { ...place('咖啡店', 'coffee'), suggestedStartTime: '25:00' }] }],
+    days: [{ ...day(1), placeQueries: [{ ...place('如家酒店'), category: 'hotel' }, place('安福路')] }],
+  }), 1, 'INVALID_CATEGORY', ['如家酒店']);
+  for (const category of ['food', 'coffee', 'shopping', 'other'] as const) {
+    assertValidationReason(JSON.stringify({
+      ...validPlan(1),
+      days: [{ ...day(1), placeQueries: [{ ...place('非核心点'), category }, place('安福路')] }],
+    }), 1, 'INVALID_CATEGORY', ['非核心点']);
+  }
+  assertValidationReason(JSON.stringify({
+    ...validPlan(1),
+    days: [{ ...day(1), placeQueries: [place('武康路'), { ...place('田子坊', 'activity'), suggestedStartTime: '25:00' }] }],
   }), 1, 'INVALID_TIME', ['25:00', '咖啡店']);
   assertValidationReason(JSON.stringify({
     ...validPlan(1),
-    days: [{ ...day(1), placeQueries: [place('武康路'), { ...place('咖啡店', 'coffee'), suggestedDurationMinutes: 10 }] }],
+    days: [{ ...day(1), placeQueries: [place('武康路'), { ...place('田子坊', 'activity'), suggestedDurationMinutes: 10 }] }],
   }), 1, 'INVALID_DURATION', ['咖啡店']);
   assertValidationReason(JSON.stringify({
     ...validPlan(2),
@@ -361,6 +378,60 @@ test('preserves provider errors without wrapping', async () => {
     },
   );
   assert.equal(provider.calls.length, 1);
+});
+
+test('a coffee and photography preference plan is valid only with sight or activity cores', () => {
+  const plan = {
+    title: '北京三日',
+    summary: '历史文化为主。',
+    days: [{
+      dayNumber: 1,
+      title: '第一日',
+      summary: '少走路看古迹。',
+      placeQueries: [place('故宫博物院'), place('景山公园', 'activity')],
+    }],
+  };
+  const parsed = parseTripPlanSuggestion(JSON.stringify(plan), 1);
+  assert.deepEqual(parsed.days[0].placeQueries.map((item) => item.category), ['sight', 'activity']);
+  assert.throws(
+    () => parseTripPlanSuggestion(JSON.stringify({
+      ...plan,
+      days: [{
+        ...plan.days[0],
+        placeQueries: [place('故宫博物院'), place('咖啡店', 'coffee')],
+      }],
+    }), 1),
+    (error: unknown) => error instanceof TripPlanValidationError && error.validationReason === 'INVALID_CATEGORY',
+  );
+});
+
+test('retries once after category hotel then accepts a valid plan', async () => {
+  let attempts = 0;
+  const withHotel = JSON.stringify({
+    ...validPlan(1),
+    days: [{
+      ...day(1),
+      placeQueries: [
+        { ...place('如家酒店'), category: 'hotel' },
+        place('天坛公园'),
+      ],
+    }],
+  });
+  const oneDayRequirement = { ...requirement, durationDays: 1, endDate: '2026-10-01' };
+  const provider = new FakeAiProvider(async () => {
+    attempts += 1;
+    if (attempts === 1) {
+      return { content: withHotel };
+    }
+    return { content: JSON.stringify(validPlan(1)) };
+  });
+  const generator = new QwenTripPlanGenerator(provider);
+  const plan = await generator.generate(oneDayRequirement);
+  assert.equal(plan.days[0].placeQueries.some((item) => item.category === 'hotel'), false);
+  assert.equal(provider.calls.length, 2);
+  assert.equal(generator.lastPlanDiagnostics?.retried, true);
+  assert.equal(generator.lastPlanDiagnostics?.validationReason, 'INVALID_CATEGORY');
+  assert.equal((provider.calls[1].messages[1]?.content ?? '').includes(TRIP_PLAN_RETRY_HINTS.INVALID_CATEGORY), true);
 });
 
 test('retries once after INVALID_TIME then accepts a valid plan', async () => {

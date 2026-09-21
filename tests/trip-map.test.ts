@@ -17,6 +17,9 @@ import {
   retainSelectedTripPlaceId,
   resolveTripMapRoutes,
   resolveTripMapStops,
+  restoreTripMapViewport,
+  tripMapMarkerColor,
+  TRIP_MAP_ROUTE_COLOR,
   shouldFocusMapForSelection,
   shouldScrollTimelineForSelection,
   shouldClearSelectionAfterReplace,
@@ -607,14 +610,43 @@ test('shanghai mock catalog places still locate every day on the map', () => {
   }
 });
 
-test('TripMap does not create polylines and uses place-card markers', () => {
+test('TripMap draws real polylines and numbered place pins', () => {
   const source = readFileSync(join(process.cwd(), 'src/components/trip/TripMap.tsx'), 'utf8');
-  assert.equal(source.includes('new AMapApi.Polyline'), false);
-  assert.equal(source.includes('Polyline'), false);
-  assert.match(source, /trip-map-place-card/);
+  assert.match(source, /new AMapApi\.Polyline/);
+  assert.match(source, /resolveTripMapRoutes/);
+  assert.match(source, /TRIP_MAP_ROUTE_COLOR/);
+  assert.match(source, /trip-map-pin/);
   assert.match(source, /textContent = stop\.name/);
-  assert.match(source, /时间待定/);
+  assert.equal(source.includes('示意地图'), false);
+  assert.equal(source.includes('不按比例'), false);
+  assert.match(source, /restoreTripMapViewport/);
+  assert.match(source, /layoutSignal/);
+  assert.match(source, /ResizeObserver/);
   const page = readFileSync(join(process.cwd(), 'src/pages/TripDetailPage.tsx'), 'utf8');
   assert.equal(page.includes('mockPlaces'), false);
   assert.match(page, /getPlacesForTrip/);
+});
+
+test('marker colors rotate on a limited travel palette', () => {
+  assert.equal(tripMapMarkerColor(0), '#3B82F6');
+  assert.equal(tripMapMarkerColor(1), '#F59E0B');
+  assert.equal(tripMapMarkerColor(4), tripMapMarkerColor(0));
+  assert.equal(TRIP_MAP_ROUTE_COLOR, '#3B82F6');
+});
+
+test('restoreTripMapViewport resizes then fits existing markers', () => {
+  const calls: string[] = [];
+  const map = {
+    resize() {
+      calls.push('resize');
+    },
+    setFitView() {
+      calls.push('fit');
+    },
+  };
+  restoreTripMapViewport(map, [{} as AMap.Marker]);
+  assert.deepEqual(calls, ['resize', 'fit']);
+  calls.length = 0;
+  restoreTripMapViewport(map, []);
+  assert.deepEqual(calls, ['resize']);
 });

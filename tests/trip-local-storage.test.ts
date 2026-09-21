@@ -25,6 +25,8 @@ import {
   persistAppliedTripChange,
   restoreTripChangeSnapshot,
 } from '../src/services/trip-change-service';
+import { itineraryTimelineItems, tripPlaceTypeLabel } from '../src/services/trip-display';
+import { isCoreTripPlace } from '../server/services/trip-day-density-planner';
 
 class MemoryStorage implements TripStorage {
   readonly values = new Map<string, string>();
@@ -132,6 +134,59 @@ test('saved generated trip and places restore in a new repository instance', asy
   assert.deepEqual(places.map((item) => item.id), ['place-live']);
   assert.equal(places[0].name, '圆明园');
   assert.equal(places[0].provider, 'amap');
+});
+
+test('old trips with hotel, cafe, restaurant and shopping places restore and display', async () => {
+  resetNotice();
+  const storage = new MemoryStorage();
+  const cases: Array<['hotel' | 'cafe' | 'restaurant' | 'shopping', string]> = [
+    ['hotel', '北京饭店'],
+    ['cafe', '三里屯咖啡'],
+    ['restaurant', '全聚德'],
+    ['shopping', '王府井百货'],
+  ];
+  const repo = new LocalStorageTripRepository(new MockTripRepository(), storage);
+  for (const [category, name] of cases) {
+    const poi = samplePlace(`place-${category}`, name);
+    poi.category = category;
+    const trip = sampleTrip(`trip-old-${category}`, '北京', '2026-09-16T08:00:00.000Z', poi);
+    trip.days[0].places[0].type = category;
+    trip.days[0].places[0].placeName = name;
+    await repo.saveGeneratedTrip({ trip, places: [poi] });
+  }
+  const restored = new LocalStorageTripRepository(new MockTripRepository(), storage);
+  const hotelTrip = await restored.getTripById('trip-old-hotel');
+  const cafeTrip = await restored.getTripById('trip-old-cafe');
+  const restaurantTrip = await restored.getTripById('trip-old-restaurant');
+  const shoppingTrip = await restored.getTripById('trip-old-shopping');
+  assert.equal(hotelTrip?.days[0].places[0].type, 'hotel');
+  assert.equal(cafeTrip?.days[0].places[0].type, 'cafe');
+  assert.equal(restaurantTrip?.days[0].places[0].type, 'restaurant');
+  assert.equal(shoppingTrip?.days[0].places[0].type, 'shopping');
+  assert.equal(tripPlaceTypeLabel.cafe, '咖啡');
+  assert.equal(isCoreTripPlace(hotelTrip!.days[0].places[0]), false);
+  assert.equal(isCoreTripPlace(cafeTrip!.days[0].places[0]), false);
+  assert.equal(isCoreTripPlace(restaurantTrip!.days[0].places[0]), false);
+});
+
+test('old trips with hotel places restore and display without counting as cores', async () => {
+  resetNotice();
+  const storage = new MemoryStorage();
+  const inn = samplePlace('place-hotel', '北京饭店');
+  inn.category = 'hotel';
+  const trip = sampleTrip('trip-old-hotel', '北京', '2026-09-16T08:00:00.000Z', inn);
+  trip.days[0].places[0].type = 'hotel';
+  trip.days[0].places[0].placeName = '北京饭店';
+  const first = new LocalStorageTripRepository(new MockTripRepository(), storage);
+  await first.saveGeneratedTrip({ trip, places: [inn] });
+  const restored = new LocalStorageTripRepository(new MockTripRepository(), storage);
+  const loaded = await restored.getTripById('trip-old-hotel');
+  const places = await restored.getPlacesForTrip('trip-old-hotel');
+  assert.equal(loaded?.days[0].places[0].type, 'hotel');
+  assert.equal(places[0].category, 'hotel');
+  assert.equal(tripPlaceTypeLabel.hotel, '酒店');
+  assert.equal(isCoreTripPlace(loaded!.days[0].places[0]), false);
+  assert.equal(itineraryTimelineItems(loaded!.days[0]).length, 1);
 });
 
 test('restores scheduleItems and still loads older trips without them', async () => {

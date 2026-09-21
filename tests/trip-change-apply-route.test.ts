@@ -398,10 +398,13 @@ test('maps TRIP_CHANGE_INCOMPLETE to 422 without leaking the query', async () =>
     throw new TripChangeExecutionError(
       'TRIP_CHANGE_INCOMPLETE',
       'upstream said 颐和园 https://restapi.amap.com key=secret',
+      'NO_MATCH',
     );
   });
+  const logger = new FakeLogger();
   const result = await request({
     executor,
+    logger,
     headers: jsonHeaders(),
     body: JSON.stringify(validPayload()),
   });
@@ -414,6 +417,13 @@ test('maps TRIP_CHANGE_INCOMPLETE to 422 without leaking the query', async () =>
   });
   assert.equal(result.text.includes('颐和园'), false);
   assert.equal(result.text.includes('restapi'), false);
+  assert.equal(result.text.includes('validationReason'), false);
+  assert.equal(result.text.includes('NO_MATCH'), false);
+  assert.equal(logger.entries.length, 1);
+  assert.equal(logger.entries[0].stage, 'change_apply');
+  assert.equal(logger.entries[0].outcome, 'failed');
+  assert.equal(logger.entries[0].errorCode, 'TRIP_CHANGE_INCOMPLETE');
+  assert.equal(logger.entries[0].validationReason, 'NO_MATCH');
   assertNoSensitiveLeak(result.text);
 });
 

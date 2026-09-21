@@ -1,4 +1,11 @@
 import type { RequirementFieldIssue, TripRequirementDraft } from '../domain/trip/ai';
+import {
+  parsePartyContextV1,
+  parseTravelProfilePatchV1,
+  parseTravelProfileSignals,
+  parseTripConstraintsV1,
+  parseTripIntentV1,
+} from '../domain/trip/profile';
 import type { PlanConversationState, PlanMessage, PlanMessageRole } from './plan-conversation-service';
 import { getMissingRequirementFields } from './plan-conversation-service';
 
@@ -71,6 +78,16 @@ function readDraft(value: unknown): TripRequirementDraft {
         : undefined,
     };
   }
+  const tripIntent = parseTripIntentV1(value.tripIntent);
+  if (tripIntent) draft.tripIntent = tripIntent;
+  const partyContext = parsePartyContextV1(value.partyContext);
+  if (partyContext) draft.partyContext = partyContext;
+  const constraints = parseTripConstraintsV1(value.constraints);
+  if (constraints) draft.constraints = constraints;
+  const profilePatch = parseTravelProfilePatchV1(value.profilePatch);
+  if (profilePatch) draft.profilePatch = profilePatch;
+  const longTermProfileSignals = parseTravelProfileSignals(value.longTermProfileSignals);
+  if (longTermProfileSignals) draft.longTermProfileSignals = longTermProfileSignals;
   return draft;
 }
 

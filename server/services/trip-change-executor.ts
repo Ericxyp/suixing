@@ -18,6 +18,8 @@ import {
 import { isCoreTripPlace, planDaySchedule } from './trip-day-density-planner';
 import { searchMealDiningPlaces } from './trip-meal-options';
 import { validateDayItineraryCompleteness } from './trip-itinerary-completeness-validator';
+import { planningPolicyFromTripContext } from '../../src/services/travel-profile-policy';
+import { parseTripPlanningContextV1 } from '../../src/domain/trip/profile';
 import type { TripChangeOperation } from './trip-change-intent-extractor';
 import { TRIP_CHANGE_MAX_QUERY_LENGTH } from './trip-change-intent-extractor';
 import {
@@ -28,6 +30,9 @@ import { hasExplicitTravelPreferences, type TripPlanPlaceCategory } from './trip
 import type { TripRouteEnricher } from './trip-route-enricher';
 import { isFiniteGeoPoint } from './trip-route-enricher';
 import { scheduleEnrichedTripDay, TripTimeScheduleError } from './trip-time-scheduler';
+import { normalizeTripChangePlaceName } from './trip-change-intent-extractor';
+
+const STABLE_PLACE_ID = /^(amap|mock):[A-Za-z0-9_-]{1,64}$/;
 
 export type TripChangeExecutionErrorCode =
   | 'INVALID_REQUEST'
@@ -42,12 +47,18 @@ export const TRIP_CHANGE_PROVIDER_UNAVAILABLE_MESSAGE = '地点或路线服务�
 export const TRIP_CHANGE_SEARCH_LIMIT = 5;
 
 export class TripChangeExecutionError extends Error {
+  readonly validationReason?: string;
+
   constructor(
     readonly code: TripChangeExecutionErrorCode,
     message: string,
+    validationReason?: string,
   ) {
     super(message);
     this.name = 'TripChangeExecutionError';
+    if (validationReason && /^[A-Z][A-Z0-9_]{0,63}$/.test(validationReason)) {
+      this.validationReason = validationReason;
+    }
   }
 }
 
@@ -138,8 +149,8 @@ function invalidRequest(): never {
   throw new TripChangeExecutionError('INVALID_REQUEST', TRIP_CHANGE_INVALID_REQUEST_MESSAGE);
 }
 
-function incomplete(): never {
-  throw new TripChangeExecutionError('TRIP_CHANGE_INCOMPLETE', TRIP_CHANGE_INCOMPLETE_MESSAGE);
+function incomplete(validationReason?: string): never {
+  throw new TripChangeExecutionError('TRIP_CHANGE_INCOMPLETE', TRIP_CHANGE_INCOMPLETE_MESSAGE, validationReason);
 }
 
 function clonePlace(place: Place): Place {
@@ -189,6 +200,119 @@ function inferQueryCategory(query: string): TripPlanPlaceCategory {
   if (/酒店|宾馆/.test(query)) return 'hotel';
   if (/商场|购物/.test(query)) return 'shopping';
   return 'sight';
+}
+
+function isStablePlaceId(value: string): boolean {
+  return STABLE_PLACE_ID.test(value);
+}
+
+function diningPlaceFromCatalog(
+  catalog: Map<string, Place>,
+  placeId: string,
+): Place | undefined {
+  const selected = catalog.get(placeId);
+  if (!selected) {
+    return undefined;
+  }
+  if (selected.category !== 'restaurant' && selected.category !== 'cafe') {
+    return undefined;
+  }
+  return clonePlace(selected);
+}
+
+async function resolvePlaceByStableId(input: {
+  placeId: string;
+  catalog: Map<string, Place>;
+  placeSearch: PlaceSearchService;
+}): Promise<Place | undefined> {
+  const fromCatalog = input.catalog.get(input.placeId);
+  if (fromCatalog) {
+    return clonePlace(fromCatalog);
+  }
+  if (typeof input.placeSearch.getByProviderPlaceId !== 'function') {
+    return undefined;
+  }
+  const providerPlaceId = input.placeId.slice(input.placeId.indexOf(':') + 1);
+  try {
+    const detailed = await input.placeSearch.getByProviderPlaceId(providerPlaceId);
+    return detailed ? clonePlace(detailed) : undefined;
+  } catch (error) {
+    mapProviderError(error);
+  }
+}
+
+async function resolveReplacementPlace(input: {
+  query: string;
+  catalog: Map<string, Place>;
+  usedPlaceIds: ReadonlySet<string>;
+  targetPlaceId: string;
+  city: string;
+  sameDayPlaces: Place[];
+  placeSearch: PlaceSearchService;
+}): Promise<Place | 'NO_MATCH' | 'DUPLICATE_MATCH'> {
+  const query = input.query.trim();
+  if (isStablePlaceId(query)) {
+    const resolved = await resolvePlaceByStableId({
+      placeId: query,
+      catalog: input.catalog,
+      placeSearch: input.placeSearch,
+    });
+    if (!resolved) {
+      return 'NO_MATCH';
+    }
+    if (resolved.id === input.targetPlaceId || input.usedPlaceIds.has(resolved.id)) {
+      return 'DUPLICATE_MATCH';
+    }
+    return resolved;
+  }
+
+  const normalizedQuery = normalizeTripChangePlaceName(query);
+  const catalogExact = [...input.catalog.values()].find((place) => (
+    normalizeTripChangePlaceName(place.name) === normalizedQuery
+    && place.id !== input.targetPlaceId
+    && !input.usedPlaceIds.has(place.id)
+  ));
+  if (catalogExact) {
+    return clonePlace(catalogExact);
+  }
+
+  let searched: Place[];
+  try {
+    searched = await input.placeSearch.search({
+      query,
+      city: input.city,
+      limit: TRIP_CHANGE_SEARCH_LIMIT,
+    });
+  } catch (error) {
+    mapProviderError(error);
+  }
+  if (!Array.isArray(searched)) {
+    mapProviderError(new AmapProviderError('PROVIDER_ERROR', TRIP_CHANGE_PROVIDER_ERROR_MESSAGE));
+  }
+  const exactFromSearch = searched.find((place) => (
+    normalizeTripChangePlaceName(place.name) === normalizedQuery
+    && place.id !== input.targetPlaceId
+    && !input.usedPlaceIds.has(place.id)
+  ));
+  if (exactFromSearch) {
+    return clonePlace(exactFromSearch);
+  }
+  return selectPlaceCandidate(
+    searched.map((place) => clonePlace(place)),
+    {
+      name: query,
+      query,
+      category: inferQueryCategory(query),
+      suggestedStartTime: '10:00',
+      suggestedDurationMinutes: 90,
+      reason: '行程修改候选地点。',
+    },
+    input.usedPlaceIds,
+    {
+      destination: input.city,
+      sameDayPlaces: input.sameDayPlaces.map((item) => clonePlace(item)),
+    },
+  );
 }
 
 function readPlace(value: unknown): Place {
@@ -553,6 +677,13 @@ function parseTrip(value: unknown): Trip {
   if (typeof value.endDate === 'string') {
     trip.endDate = value.endDate;
   }
+  if (value.planningContext !== undefined) {
+    const planningContext = parseTripPlanningContextV1(value.planningContext);
+    if (!planningContext) {
+      invalidRequest();
+    }
+    trip.planningContext = planningContext;
+  }
   return trip;
 }
 
@@ -669,6 +800,12 @@ function applyPlannedDaySchedule(trip: Trip, day: TripDay, diningMode: 'flexible
     places: day.places,
     dayNumber: day.dayNumber,
     dayTitle: day.title,
+    planningPolicy: trip.planningContext
+      ? planningPolicyFromTripContext({
+        pace: trip.pace,
+        planningContext: trip.planningContext,
+      })
+      : undefined,
   });
   day.scheduleItems = planned.items;
   const byId = new Map(planned.places.map((place) => [place.id, place]));
@@ -676,6 +813,9 @@ function applyPlannedDaySchedule(trip: Trip, day: TripDay, diningMode: 'flexible
     const next = byId.get(place.id);
     if (next?.startTime) {
       place.startTime = next.startTime;
+    }
+    if (typeof next?.durationMinutes === 'number') {
+      place.durationMinutes = next.durationMinutes;
     }
   }
 }
@@ -714,6 +854,10 @@ async function completeDayCorePlaces(input: {
     },
     destination: input.trip.destination,
     pace: input.trip.pace,
+    policy: planningPolicyFromTripContext({
+      pace: input.trip.pace,
+      planningContext: input.trip.planningContext,
+    }),
     placeSearch: input.placeSearch,
     hasExplicitTravelPreferences: hasExplicitTravelPreferences({ preferences: input.trip.preferences }),
     preferenceTerms: [
@@ -742,8 +886,15 @@ async function completeDayCorePlaces(input: {
       estimatedCost: 0,
     };
   });
-  if (dayNeedsCorePlaceCompletion(done, input.trip.pace)) {
-    incomplete();
+  if (dayNeedsCorePlaceCompletion(
+    done,
+    input.trip.pace,
+    planningPolicyFromTripContext({
+      pace: input.trip.pace,
+      planningContext: input.trip.planningContext,
+    }).targetCorePlacesPerDay,
+  )) {
+    incomplete('MISSING_CORE_PLACES');
   }
 }
 
@@ -773,44 +924,23 @@ export class AmapTripChangeExecutor implements TripChangeExecutor {
     const usedPlaceIds = collectUsedPlaceIds(trip, target.id);
     usedPlaceIds.add(target.placeId);
 
-    let searched: Place[];
-    try {
-      searched = await this.placeSearch.search({
-        query: operation.replacementQuery,
-        city: trip.destination,
-        limit: TRIP_CHANGE_SEARCH_LIMIT,
-      });
-    } catch (error) {
-      mapProviderError(error);
-    }
-    if (!Array.isArray(searched)) {
-      mapProviderError(new AmapProviderError('PROVIDER_ERROR', TRIP_CHANGE_PROVIDER_ERROR_MESSAGE));
-    }
-    const selected = selectPlaceCandidate(
-      searched.map((place) => clonePlace(place)),
-      {
-        name: operation.replacementQuery,
-        query: operation.replacementQuery,
-        category: inferQueryCategory(operation.replacementQuery),
-        suggestedStartTime: '10:00',
-        suggestedDurationMinutes: 90,
-        reason: '行程修改候选地点。',
-      },
+    const selected = await resolveReplacementPlace({
+      query: operation.replacementQuery,
+      catalog,
       usedPlaceIds,
-      {
-        destination: trip.destination,
-        sameDayPlaces: day.places
-          .filter((item) => item.id !== target.id)
-          .map((item) => catalog.get(item.placeId))
-          .filter((item): item is Place => item !== undefined)
-          .map((item) => clonePlace(item)),
-      },
-    );
+      targetPlaceId: target.placeId,
+      city: trip.destination,
+      sameDayPlaces: day.places
+        .filter((item) => item.id !== target.id)
+        .map((item) => catalog.get(item.placeId))
+        .filter((item): item is Place => item !== undefined),
+      placeSearch: this.placeSearch,
+    });
     if (selected === 'NO_MATCH' || selected === 'DUPLICATE_MATCH') {
-      incomplete();
+      incomplete(selected === 'DUPLICATE_MATCH' ? 'DUPLICATE_MATCH' : 'NO_MATCH');
     }
     if (selected.id === target.placeId || usedPlaceIds.has(selected.id)) {
-      incomplete();
+      incomplete('DUPLICATE_MATCH');
     }
 
     const nextTrip = structuredClone(trip);
@@ -1094,13 +1224,17 @@ export class AmapTripChangeExecutor implements TripChangeExecutor {
     applyPlannedDaySchedule(nextTrip, nextDay, 'flexible');
     const completeness = validateDayItineraryCompleteness({
       pace: nextTrip.pace,
+      targetCorePlacesPerDay: planningPolicyFromTripContext({
+        pace: nextTrip.pace,
+        planningContext: nextTrip.planningContext,
+      }).targetCorePlacesPerDay,
       placeIds: new Set(nextDay.places.map((place) => place.id)),
       corePlaceCount: nextDay.places.filter((place) => isCoreTripPlace(place)).length,
       items: nextDay.scheduleItems ?? [],
       places: nextDay.places,
     });
     if (!completeness.valid) {
-      incomplete();
+      incomplete(completeness.reason);
     }
 
     return {
@@ -1152,24 +1286,60 @@ export class AmapTripChangeExecutor implements TripChangeExecutor {
       ? day.places.find((place) => place.id === slot.nextTripPlaceId)
       : undefined;
     const nextPlace = nextStop ? catalog.get(nextStop.placeId) : undefined;
-    let candidates: Place[];
-    try {
-      candidates = await searchMealDiningPlaces({
-        city: trip.destination,
-        mealPeriod: slot.mealPeriod,
-        area: areaPlace,
-        ...(nextPlace ? { nextPlace } : {}),
+    let selected = diningPlaceFromCatalog(catalog, operation.placeId);
+    if (!selected && isStablePlaceId(operation.placeId)) {
+      const byId = await resolvePlaceByStableId({
+        placeId: operation.placeId,
+        catalog,
         placeSearch: this.placeSearch,
       });
-    } catch (error) {
-      mapProviderError(error);
+      if (byId && (byId.category === 'restaurant' || byId.category === 'cafe')) {
+        selected = byId;
+      } else if (byId) {
+        incomplete('MEAL_CANDIDATE_UNAVAILABLE');
+      }
     }
-    const selected = candidates.find((place) => place.id === operation.placeId);
+    if (!selected) {
+      let candidates: Place[] = [];
+      try {
+        const nearbyName = areaPlace.name.includes('附近') ? areaPlace.name : `${areaPlace.name}附近`;
+        const nearby = await searchMealDiningPlaces({
+          city: trip.destination,
+          mealPeriod: slot.mealPeriod,
+          area: {
+            ...areaPlace,
+            name: nearbyName,
+          },
+          ...(nextPlace ? { nextPlace } : {}),
+          placeSearch: this.placeSearch,
+        });
+        const selectedNearby = nearby.find((place) => place.id === operation.placeId);
+        if (selectedNearby) {
+          candidates = nearby;
+        } else {
+          const fallback = await searchMealDiningPlaces({
+            city: trip.destination,
+            mealPeriod: slot.mealPeriod,
+            area: areaPlace,
+            ...(nextPlace ? { nextPlace } : {}),
+            placeSearch: this.placeSearch,
+          });
+          const seen = new Set(nearby.map((place) => place.id));
+          candidates = [...nearby, ...fallback.filter((place) => !seen.has(place.id))];
+        }
+      } catch (error) {
+        mapProviderError(error);
+      }
+      const matched = candidates.find((place) => place.id === operation.placeId);
+      if (matched) {
+        selected = clonePlace(matched);
+      }
+    }
     if (!selected || (selected.category !== 'restaurant' && selected.category !== 'cafe')) {
-      incomplete();
+      incomplete('MEAL_CANDIDATE_UNAVAILABLE');
     }
     if (collectUsedPlaceIds(trip, '').has(selected.id)) {
-      incomplete();
+      incomplete('MEAL_CANDIDATE_UNAVAILABLE');
     }
 
     const nextTrip = structuredClone(trip);
@@ -1199,13 +1369,6 @@ export class AmapTripChangeExecutor implements TripChangeExecutor {
     });
     nextTrip.updatedAt = input.updatedAt;
     catalog.set(selected.id, clonePlace(selected));
-
-    await completeDayCorePlaces({
-      trip: nextTrip,
-      day: nextDay,
-      catalog,
-      placeSearch: this.placeSearch,
-    });
 
     const routeRecalculated = nextDay.places.length >= 2;
     if (routeRecalculated) {
@@ -1451,13 +1614,17 @@ export class AmapTripChangeExecutor implements TripChangeExecutor {
     applyPlannedDaySchedule(nextTrip, nextDay, 'flexible');
     const completeness = validateDayItineraryCompleteness({
       pace: nextTrip.pace,
+      targetCorePlacesPerDay: planningPolicyFromTripContext({
+        pace: nextTrip.pace,
+        planningContext: nextTrip.planningContext,
+      }).targetCorePlacesPerDay,
       placeIds: new Set(nextDay.places.map((place) => place.id)),
       corePlaceCount: nextDay.places.filter((place) => isCoreTripPlace(place)).length,
       items: nextDay.scheduleItems ?? [],
       places: nextDay.places,
     });
     if (!completeness.valid) {
-      incomplete();
+      incomplete(completeness.reason);
     }
 
     return {

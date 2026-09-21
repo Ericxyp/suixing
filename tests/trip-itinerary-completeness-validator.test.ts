@@ -247,6 +247,47 @@ test('relaxed two cores are allowed without generic free time', () => {
   assert.equal(valid.valid, true);
 });
 
+test('a meal_place is a complete lunch arrangement on a three-core balanced day', () => {
+  const withPlace = validateDayItineraryCompleteness({
+    pace: 'balanced',
+    placeIds: new Set(['a', 'lunch', 'b', 'c']),
+    corePlaceCount: 3,
+    items: [
+      place('a', '10:00'),
+      {
+        kind: 'meal_place',
+        tripPlaceId: 'lunch',
+        mealPeriod: 'lunch',
+        startTime: '11:30',
+        durationMinutes: 75,
+      },
+      place('b', '13:00'),
+      place('c', '15:30'),
+    ],
+  });
+  assert.equal(withPlace.valid, true, withPlace.reason);
+
+  const missingPlace = validateDayItineraryCompleteness({
+    pace: 'balanced',
+    placeIds: new Set(['a', 'b', 'c']),
+    corePlaceCount: 3,
+    items: [
+      place('a', '10:00'),
+      {
+        kind: 'meal_place',
+        tripPlaceId: 'missing-lunch',
+        mealPeriod: 'lunch',
+        startTime: '11:30',
+        durationMinutes: 75,
+      },
+      place('b', '13:00'),
+      place('c', '15:00'),
+    ],
+  });
+  assert.equal(missingPlace.valid, false);
+  assert.equal(missingPlace.reason, 'INVALID_SCHEDULE_REFERENCE');
+});
+
 test('packed days require three cores and do not invent a fourth', () => {
   const valid = validateDayItineraryCompleteness({
     pace: 'packed',
@@ -297,5 +338,103 @@ test('packed days require three cores and do not invent a fourth', () => {
   });
   assert.equal(short.valid, false);
   assert.equal(short.reason, 'INSUFFICIENT_CORE_PLACES');
+});
+
+function twoCoreExecutableDay(overrides: {
+  lunch?: boolean;
+  overlap?: boolean;
+  earlyEnd?: boolean;
+} = {}): TripScheduleItem[] {
+  const lunch = overrides.lunch === false
+    ? []
+    : [{
+      kind: 'meal_slot' as const,
+      id: 'lunch',
+      mealPeriod: 'lunch' as const,
+      startTime: overrides.overlap ? '10:30' : '11:45',
+      durationMinutes: 75,
+      areaTripPlaceId: 'a',
+      nextTripPlaceId: 'b',
+      diningMode: 'flexible' as const,
+    }];
+  return [
+    place('a', '10:00'),
+    ...lunch,
+    place('b', overrides.overlap ? '11:00' : '13:30'),
+    {
+      kind: 'hotel_return',
+      id: 'back',
+      startTime: overrides.earlyEnd ? '14:30' : '16:30',
+      durationMinutes: 45,
+      title: '返程准备',
+      description: '结束当天行程，返回住处。',
+    },
+  ];
+}
+
+test('parents low-walking policy allows a complete two-core balanced day', () => {
+  const result = validateDayItineraryCompleteness({
+    pace: 'balanced',
+    targetCorePlacesPerDay: 2,
+    placeIds: new Set(['a', 'b']),
+    corePlaceCount: 2,
+    items: twoCoreExecutableDay(),
+  });
+  assert.equal(result.valid, true, result.reason);
+});
+
+test('default balanced two-core days stay INVALID_TWO_PLACE_DAY', () => {
+  const result = validateDayItineraryCompleteness({
+    pace: 'balanced',
+    placeIds: new Set(['a', 'b']),
+    corePlaceCount: 2,
+    items: twoCoreExecutableDay(),
+  });
+  assert.equal(result.valid, false);
+  assert.equal(result.reason, 'INVALID_TWO_PLACE_DAY');
+});
+
+test('policy two-core days still fail missing lunch, overlap and early endings', () => {
+  const missingLunch = validateDayItineraryCompleteness({
+    pace: 'balanced',
+    targetCorePlacesPerDay: 2,
+    placeIds: new Set(['a', 'b']),
+    corePlaceCount: 2,
+    items: twoCoreExecutableDay({ lunch: false }),
+  });
+  assert.equal(missingLunch.valid, false);
+  assert.equal(missingLunch.reason, 'MISSING_LUNCH');
+
+  const overlap = validateDayItineraryCompleteness({
+    pace: 'balanced',
+    targetCorePlacesPerDay: 2,
+    placeIds: new Set(['a', 'b']),
+    corePlaceCount: 2,
+    items: twoCoreExecutableDay({ overlap: true }),
+  });
+  assert.equal(overlap.valid, false);
+  assert.ok(overlap.reason === 'SCHEDULE_OVERLAP' || overlap.reason === 'MEAL_REST_CONFLICT');
+
+  const early = validateDayItineraryCompleteness({
+    pace: 'balanced',
+    targetCorePlacesPerDay: 2,
+    placeIds: new Set(['a', 'b']),
+    corePlaceCount: 2,
+    items: twoCoreExecutableDay({ earlyEnd: true }),
+  });
+  assert.equal(early.valid, false);
+  assert.equal(early.reason, 'DAY_ENDS_TOO_EARLY');
+});
+
+test('packed days still require three cores even when policy target is 2', () => {
+  const result = validateDayItineraryCompleteness({
+    pace: 'packed',
+    targetCorePlacesPerDay: 2,
+    placeIds: new Set(['a', 'b']),
+    corePlaceCount: 2,
+    items: twoCoreExecutableDay(),
+  });
+  assert.equal(result.valid, false);
+  assert.equal(result.reason, 'INSUFFICIENT_CORE_PLACES');
 });
 

@@ -8,7 +8,11 @@ import {
   type TripChangeExecutor,
 } from '../services/trip-change-executor';
 import { parseTripMealApplyBody } from '../services/trip-meal-apply-request';
-import { safeGenerationErrorCode, type GenerationStageLogger } from '../services/generation-logger';
+import {
+  safeGenerationErrorCode,
+  safeGenerationValidationReason,
+  type GenerationStageLogger,
+} from '../services/generation-logger';
 
 const METHOD_MESSAGE = '仅支持执行餐饮选择。';
 const UNSUPPORTED_TYPE_MESSAGE = '请使用 JSON 提交餐饮选择。';
@@ -37,13 +41,16 @@ export function createTripMealApplyRouter(
   const router = Router();
   router.all('/trips/meal/apply', async (request: Request, response: Response) => {
     const started = Date.now();
-    const log = (outcome: 'success' | 'failed', errorCode?: string) => {
+    const log = (outcome: 'success' | 'failed', error?: unknown) => {
+      const errorCode = error === undefined ? undefined : safeGenerationErrorCode(error);
+      const validationReason = error === undefined ? undefined : safeGenerationValidationReason(error);
       logger?.logStage({
         requestId: 'omitted',
         stage: 'meal_apply',
         outcome,
         durationMs: Date.now() - started,
         ...(errorCode ? { errorCode } : {}),
+        ...(validationReason ? { validationReason } : {}),
       });
     };
     if (request.method !== 'POST') {
@@ -60,7 +67,7 @@ export function createTripMealApplyRouter(
       return;
     }
     if (!executor) {
-      log('failed', 'PROVIDER_UNAVAILABLE');
+      log('failed', { code: 'PROVIDER_UNAVAILABLE' });
       sendError(response, 503, 'PROVIDER_UNAVAILABLE', PROVIDER_UNAVAILABLE_MESSAGE);
       return;
     }
@@ -80,8 +87,7 @@ export function createTripMealApplyRouter(
         },
       });
     } catch (error) {
-      const errorCode = safeGenerationErrorCode(error);
-      log('failed', errorCode);
+      log('failed', error);
       if (error instanceof TripChangeExecutionError) {
         if (error.code === 'INVALID_REQUEST') {
           sendError(response, 400, 'INVALID_REQUEST', TRIP_CHANGE_INVALID_REQUEST_MESSAGE);

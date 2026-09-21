@@ -1,3 +1,4 @@
+import type { PlanningPolicyV1 } from '../../src/domain/trip/profile';
 import type {
   Place,
   TripDiningMode,
@@ -15,6 +16,9 @@ export const MAX_CLOCK_MINUTES = 23 * 60 + 59;
 export const LONG_STAY_MINUTES = 180;
 export const DEFAULT_LUNCH_MINUTES = 75;
 export const MIN_LUNCH_MINUTES = 60;
+export const LOW_WALKING_TWO_CORE_MIN_END_MINUTES = 16 * 60 + 30;
+export const MAX_CORE_STAY_EXTENSION_MINUTES = 60;
+export const MAX_SCHEDULE_GAP_MINUTES = 90;
 
 export type DensityPlanReason =
   | 'PLACE'
@@ -25,6 +29,8 @@ export type DensityPlanReason =
   | 'HOTEL_RETURN'
   | 'SKIPPED_PACKED';
 
+export type TripSchedulePolicy = Pick<PlanningPolicyV1, 'targetCorePlacesPerDay'>;
+
 export interface PlanDayScheduleInput {
   dayId: string;
   destination: string;
@@ -34,6 +40,7 @@ export interface PlanDayScheduleInput {
   dayNumber?: number;
   dayTitle?: string;
   catalog?: readonly Place[];
+  planningPolicy?: TripSchedulePolicy;
 }
 
 export interface PlanDayScheduleResult {
@@ -57,6 +64,13 @@ export function resolveTripPace(pace?: TripPace): TripPace {
     return pace;
   }
   return 'balanced';
+}
+
+export function isLowWalkingTwoCoreSchedule(
+  pace?: TripPace,
+  targetCorePlacesPerDay?: 2 | 3,
+): boolean {
+  return targetCorePlacesPerDay === 2 && resolveTripPace(pace) !== 'packed';
 }
 
 export function parseClockMinutes(value: unknown): number | undefined {
@@ -119,6 +133,114 @@ function transitAfter(place: TripPlace | undefined): number {
   return 0;
 }
 
+function lastDraftEnd(drafts: readonly DraftItem[]): number {
+  return drafts.reduce((max, item) => (
+    Math.max(max, (parseClockMinutes(item.startTime) ?? 0) + item.durationMinutes)
+  ), 0);
+}
+
+function applyDraftCursor(drafts: DraftItem[], startCursor: number): void {
+  let cursor = startCursor;
+  for (let index = 0; index < drafts.length; index += 1) {
+    const item = drafts[index];
+    const startTime = formatClockMinutes(cursor);
+    if (!startTime) {
+      break;
+    }
+    item.startTime = startTime;
+    if (item.placeRef) {
+      item.placeRef.startTime = startTime;
+    }
+    const end = cursor + item.durationMinutes;
+    const next = drafts[index + 1];
+    if (!next) {
+      cursor = end;
+      break;
+    }
+    const lastAnchored = [...drafts.slice(0, index + 1)].reverse().find((entry) => entry.placeRef);
+    const transit = next?.placeRef && lastAnchored?.placeRef
+      ? transitAfter(lastAnchored.placeRef)
+      : 0;
+    cursor = ceilToStep(end + transit + TRANSFER_BUFFER_MINUTES);
+  }
+}
+
+function maxReasonableCoreStay(durationMinutes: number): number {
+  return Math.min(LONG_STAY_MINUTES, durationMinutes + MAX_CORE_STAY_EXTENSION_MINUTES);
+}
+
+function stretchLowWalkingTwoCoreDrafts(
+  drafts: DraftItem[],
+  cores: readonly TripPlace[],
+  startCursor: number,
+  reasons: DensityPlanReason[],
+  dayId: string,
+): void {
+  applyDraftCursor(drafts, startCursor);
+  const coreDrafts = drafts.filter((item) => (
+    item.kind === 'place' && cores.some((place) => place.id === item.tripPlaceId)
+  ));
+  const caps = coreDrafts.map((item) => maxReasonableCoreStay(item.durationMinutes));
+  let remaining = LOW_WALKING_TWO_CORE_MIN_END_MINUTES - lastDraftEnd(drafts);
+  while (remaining > 0) {
+    let progressed = false;
+    for (let index = 0; index < coreDrafts.length; index += 1) {
+      if (remaining <= 0) {
+        break;
+      }
+      const draft = coreDrafts[index];
+      const cap = caps[index];
+      if (!draft || cap === undefined) {
+        continue;
+      }
+      const add = Math.min(5, remaining, cap - draft.durationMinutes);
+      if (add <= 0) {
+        continue;
+      }
+      draft.durationMinutes += add;
+      if (draft.placeRef) {
+        draft.placeRef.durationMinutes = draft.durationMinutes;
+      }
+      remaining -= add;
+      progressed = true;
+    }
+    if (!progressed) {
+      break;
+    }
+  }
+  applyDraftCursor(drafts, startCursor);
+  remaining = LOW_WALKING_TWO_CORE_MIN_END_MINUTES - lastDraftEnd(drafts);
+  if (remaining <= 0) {
+    return;
+  }
+  const lastCore = [...cores].reverse()[0];
+  const lastCoreIndex = drafts.findIndex((item) => (
+    item.kind === 'place' && item.tripPlaceId === lastCore?.id
+  ));
+  if (lastCoreIndex < 0) {
+    return;
+  }
+  const lastCoreItem = drafts[lastCoreIndex];
+  const lastCoreEnd = (parseClockMinutes(lastCoreItem.startTime) ?? 0) + lastCoreItem.durationMinutes;
+  if (lastCoreEnd < 14 * 60) {
+    return;
+  }
+  const restMinutes = Math.min(REST_MAX_MINUTES, ceilToStep(remaining));
+  if (restMinutes < 15) {
+    return;
+  }
+  drafts.splice(lastCoreIndex + 1, 0, {
+    kind: 'rest',
+    id: `${dayId}:rest:evening`,
+    startTime: lastCoreItem.startTime,
+    durationMinutes: restMinutes,
+    title: '参观后休息',
+    description: '参观后稍作休息，再继续当天安排。',
+  });
+  reasons.push('REST');
+  applyDraftCursor(drafts, startCursor);
+}
+
 export function cloneTripScheduleItems(
   items: readonly TripScheduleItem[] | undefined,
 ): TripScheduleItem[] | undefined {
@@ -128,17 +250,41 @@ export function cloneTripScheduleItems(
   return structuredClone(items) as TripScheduleItem[];
 }
 
+function mealPeriodForTripPlace(
+  place: TripPlace,
+  start: number,
+  alreadyLunch: boolean,
+): 'lunch' | 'dinner' {
+  if (place.id.includes(':meal:lunch')) {
+    return 'lunch';
+  }
+  if (place.id.includes(':meal:dinner')) {
+    return 'dinner';
+  }
+  if (alreadyLunch) {
+    return 'dinner';
+  }
+  return mealPeriodForStart(start) ?? 'lunch';
+}
+
 export function planDaySchedule(input: PlanDayScheduleInput): PlanDayScheduleResult {
   void input.destination;
   const places = [...input.places]
     .filter((place) => (place.durationMinutes ?? 0) >= 1)
-    .sort((left, right) => (
-      (parseClockMinutes(left.startTime) ?? left.order) - (parseClockMinutes(right.startTime) ?? right.order)
-    ))
+    .sort((left, right) => {
+      if (left.order !== right.order) {
+        return left.order - right.order;
+      }
+      return (parseClockMinutes(left.startTime) ?? 0) - (parseClockMinutes(right.startTime) ?? 0);
+    })
     .map((place) => clonePlace(place));
   const reasons: DensityPlanReason[] = [];
   const pace = resolveTripPace(input.pace);
   const diningMode = resolveDiningMode(input.diningMode);
+  const lowWalkingTwoCore = isLowWalkingTwoCoreSchedule(
+    pace,
+    input.planningPolicy?.targetCorePlacesPerDay,
+  );
   const drafts: DraftItem[] = [];
 
   for (const place of places) {
@@ -148,13 +294,12 @@ export function planDaySchedule(input: PlanDayScheduleInput): PlanDayScheduleRes
       const alreadyLunch = drafts.some((item) => (
         (item.kind === 'meal' || item.kind === 'meal_place') && item.mealPeriod === 'lunch'
       ));
-      const mealPeriod = alreadyLunch ? 'dinner' : mealPeriodForStart(start) ?? 'lunch';
       drafts.push({
         kind: 'meal_place',
         tripPlaceId: place.id,
         startTime: place.startTime ?? '12:00',
         durationMinutes,
-        mealPeriod,
+        mealPeriod: mealPeriodForTripPlace(place, start, alreadyLunch),
         placeRef: place,
       });
       reasons.push('MEAL');
@@ -224,31 +369,13 @@ export function planDaySchedule(input: PlanDayScheduleInput): PlanDayScheduleRes
     }
   }
 
-  let cursor = parseClockMinutes(places[0]?.startTime) ?? 10 * 60;
-  if (cursor < 10 * 60 || cursor > 11 * 60 + 30) {
-    cursor = 10 * 60;
+  let startCursor = parseClockMinutes(places[0]?.startTime) ?? 10 * 60;
+  if (startCursor < 10 * 60 || startCursor > 11 * 60 + 30) {
+    startCursor = 10 * 60;
   }
-  for (let index = 0; index < drafts.length; index += 1) {
-    const item = drafts[index];
-    const startTime = formatClockMinutes(cursor);
-    if (!startTime) {
-      break;
-    }
-    item.startTime = startTime;
-    if (item.placeRef) {
-      item.placeRef.startTime = startTime;
-    }
-    const end = cursor + item.durationMinutes;
-    const next = drafts[index + 1];
-    if (!next) {
-      cursor = end;
-      break;
-    }
-    const lastPlace = [...drafts.slice(0, index + 1)].reverse().find((entry) => entry.kind === 'place');
-    const transit = next.kind === 'place' && lastPlace?.placeRef
-      ? transitAfter(lastPlace.placeRef)
-      : 0;
-    cursor = ceilToStep(end + transit + TRANSFER_BUFFER_MINUTES);
+  applyDraftCursor(drafts, startCursor);
+  if (lowWalkingTwoCore) {
+    stretchLowWalkingTwoCoreDrafts(drafts, cores, startCursor, reasons, input.dayId);
   }
 
   const hasDinner = drafts.some((item) => (
@@ -324,12 +451,14 @@ export function planDaySchedule(input: PlanDayScheduleInput): PlanDayScheduleRes
     Math.max(max, (parseClockMinutes(item.startTime) ?? 0) + item.durationMinutes)
   ), 0);
   if (stillNeedsEvening && afterWalkEnd < 17 * 60 && pace !== 'packed') {
-    const start = ceilToStep(Math.max(
-      afterWalkEnd + TRANSFER_BUFFER_MINUTES,
-      pace === 'relaxed' ? 16 * 60 : 16 * 60 + 15,
-    ));
+    const minStart = afterWalkEnd + TRANSFER_BUFFER_MINUTES;
+    const maxStart = afterWalkEnd + MAX_SCHEDULE_GAP_MINUTES;
+    const preferredStart = lowWalkingTwoCore
+      ? Math.max(minStart, LOW_WALKING_TWO_CORE_MIN_END_MINUTES - 45)
+      : Math.max(minStart, pace === 'relaxed' ? 16 * 60 : 16 * 60 + 15);
+    const start = ceilToStep(Math.min(Math.max(preferredStart, minStart), maxStart));
     const startTime = formatClockMinutes(start);
-    if (startTime && start <= 20 * 60 + 30 && start - afterWalkEnd <= 90) {
+    if (startTime && start <= 20 * 60 + 30 && start - afterWalkEnd <= MAX_SCHEDULE_GAP_MINUTES) {
       drafts.push({
         kind: 'hotel_return',
         id: `${input.dayId}:return:1`,

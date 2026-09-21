@@ -42,10 +42,35 @@ export type ReplacePlaceOperation = {
   replacementQuery: string;
 };
 
+export interface TripChangeCandidate {
+  placeId: string;
+  name: string;
+  categoryLabel: string;
+  relation: string;
+}
+
+export interface TripChangeSourceChoice {
+  tripPlaceId: string;
+  placeName: string;
+}
+
+export interface TripChangePendingReplace {
+  dayNumber: number;
+  targetTripPlaceId: string;
+}
+
+export interface TripChangeFocus {
+  selectedDayNumber?: number;
+  sourceTripPlaceId?: string;
+}
+
 export interface TripChangeIntent {
-  status: 'ready' | 'needs_clarification';
+  status: 'ready' | 'needs_clarification' | 'needs_choice';
   summary: string;
   operations: ReplacePlaceOperation[];
+  candidates?: TripChangeCandidate[];
+  sourceChoices?: TripChangeSourceChoice[];
+  pendingReplace?: TripChangePendingReplace;
 }
 
 export interface ReplacePlaceSummary {
@@ -125,6 +150,81 @@ function readReplaceOperation(value: unknown): ReplacePlaceOperation {
   };
 }
 
+const INTENT_PUBLIC_KEYS = new Set([
+  'status',
+  'summary',
+  'operations',
+  'candidates',
+  'sourceChoices',
+  'pendingReplace',
+]);
+
+function readCandidate(value: unknown): TripChangeCandidate {
+  if (!isRecord(value)) {
+    invalidResponse();
+  }
+  const keys = Object.keys(value);
+  if (
+    keys.length !== 4
+    || typeof value.placeId !== 'string'
+    || value.placeId.trim() === ''
+    || typeof value.name !== 'string'
+    || value.name.trim() === ''
+    || typeof value.categoryLabel !== 'string'
+    || value.categoryLabel.trim() === ''
+    || typeof value.relation !== 'string'
+    || value.relation.trim() === ''
+  ) {
+    invalidResponse();
+  }
+  return {
+    placeId: value.placeId.trim(),
+    name: value.name.trim(),
+    categoryLabel: value.categoryLabel.trim(),
+    relation: value.relation.trim(),
+  };
+}
+
+function readSourceChoice(value: unknown): TripChangeSourceChoice {
+  if (!isRecord(value)) {
+    invalidResponse();
+  }
+  const keys = Object.keys(value);
+  if (
+    keys.length !== 2
+    || typeof value.tripPlaceId !== 'string'
+    || value.tripPlaceId.trim() === ''
+    || typeof value.placeName !== 'string'
+    || value.placeName.trim() === ''
+  ) {
+    invalidResponse();
+  }
+  return {
+    tripPlaceId: value.tripPlaceId.trim(),
+    placeName: value.placeName.trim(),
+  };
+}
+
+function readPendingReplace(value: unknown): TripChangePendingReplace {
+  if (!isRecord(value)) {
+    invalidResponse();
+  }
+  const keys = Object.keys(value);
+  if (
+    keys.length !== 2
+    || typeof value.dayNumber !== 'number'
+    || !Number.isInteger(value.dayNumber)
+    || typeof value.targetTripPlaceId !== 'string'
+    || value.targetTripPlaceId.trim() === ''
+  ) {
+    invalidResponse();
+  }
+  return {
+    dayNumber: value.dayNumber,
+    targetTripPlaceId: value.targetTripPlaceId.trim(),
+  };
+}
+
 export function parseTripChangeIntentPayload(payload: unknown): TripChangeIntent {
   if (!isRecord(payload) || !isRecord(payload.data) || !isRecord(payload.data.intent)) {
     invalidResponse();
@@ -136,8 +236,15 @@ export function parseTripChangeIntentPayload(payload: unknown): TripChangeIntent
   const intent = payload.data.intent;
   const intentKeys = Object.keys(intent);
   if (
-    intentKeys.length !== 3
-    || (intent.status !== 'ready' && intent.status !== 'needs_clarification')
+    intentKeys.some((key) => !INTENT_PUBLIC_KEYS.has(key))
+    || !('status' in intent)
+    || !('summary' in intent)
+    || !('operations' in intent)
+    || (
+      intent.status !== 'ready'
+      && intent.status !== 'needs_clarification'
+      && intent.status !== 'needs_choice'
+    )
     || typeof intent.summary !== 'string'
     || intent.summary.trim() === ''
     || intent.summary.length > 120
@@ -153,6 +260,27 @@ export function parseTripChangeIntentPayload(payload: unknown): TripChangeIntent
       status: 'needs_clarification',
       summary: intent.summary.trim(),
       operations: [],
+      ...(Array.isArray(intent.sourceChoices)
+        ? { sourceChoices: intent.sourceChoices.map(readSourceChoice) }
+        : {}),
+    };
+  }
+  if (intent.status === 'needs_choice') {
+    if (intent.operations.length !== 0) {
+      invalidResponse();
+    }
+    const candidates = Array.isArray(intent.candidates)
+      ? intent.candidates.map(readCandidate)
+      : [];
+    if (candidates.length < 1 || candidates.length > 5) {
+      invalidResponse();
+    }
+    return {
+      status: 'needs_choice',
+      summary: intent.summary.trim(),
+      operations: [],
+      candidates,
+      ...(intent.pendingReplace ? { pendingReplace: readPendingReplace(intent.pendingReplace) } : {}),
     };
   }
   if (intent.operations.length !== 1) {
@@ -217,7 +345,7 @@ export function parseTripChangeApplyPayload(payload: unknown): TripChangeApplyRe
 }
 
 export interface TripChangeInterpretService {
-  interpret(input: string, trip: Trip): Promise<TripChangeIntent>;
+  interpret(input: string, trip: Trip, focus?: TripChangeFocus): Promise<TripChangeIntent>;
 }
 
 export interface TripChangeApplyService {
@@ -236,13 +364,16 @@ export class BffTripChangeService implements TripChangeInterpretService, TripCha
     this.client = new BffHttpClient(fetchImpl, 8_000, TRIP_CHANGE_INTERPRET_TIMEOUT_MS);
   }
 
-  async interpret(input: string, trip: Trip): Promise<TripChangeIntent> {
+  async interpret(input: string, trip: Trip, focus?: TripChangeFocus): Promise<TripChangeIntent> {
     if (typeof input !== 'string' || input.trim() === '' || input.length > TRIP_CHANGE_MAX_INPUT_LENGTH) {
       throw new BffClientError('INVALID_REQUEST', INVALID_REQUEST_MESSAGE);
     }
     const payload = await this.client.post(TRIP_CHANGE_INTERPRET_PATH, {
       input: input.trim(),
       context: buildTripChangeContext(trip),
+      ...(focus && (focus.selectedDayNumber || focus.sourceTripPlaceId)
+        ? { focus }
+        : {}),
     }, TRIP_CHANGE_INTERPRET_TIMEOUT_MS);
     return parseTripChangeIntentPayload(payload);
   }

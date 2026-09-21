@@ -6,10 +6,15 @@ import {
   type AmapJsApi,
 } from '../../services/amap-js-loader';
 import {
+  resolveTripMapRoutes,
   resolveTripMapStops,
-  TRIP_PLACE_TYPE_LABELS,
+  restoreTripMapViewport,
+  tripMapMarkerColor,
+  TRIP_MAP_ROUTE_COLOR,
   type TripMapStop,
 } from '../../services/trip-map';
+import { isUsableMapContainer } from '../../services/mobile-viewport';
+import { formatDayWorkspaceSummary, dayWorkspaceSummary, visibleUserText } from '../../services/trip-display';
 import { ErrorState, LoadingState } from '../common/States';
 
 interface TripMapProps {
@@ -20,6 +25,7 @@ interface TripMapProps {
   onStopSelect?: (tripPlaceId: string) => void;
   focusTripPlaceId?: string | null;
   onFocusHandled?: (tripPlaceId: string) => void;
+  layoutSignal?: string;
 }
 
 type MapStatus = 'loading' | 'ready' | 'missing-key' | 'error';
@@ -37,39 +43,37 @@ function removeMarkerClickBindings(bindings: readonly MarkerClickBinding[]): voi
   }
 }
 
-function createPlaceCard(stop: TripMapStop, index: number, selected: boolean): HTMLButtonElement {
+function createPlacePin(stop: TripMapStop, index: number, selected: boolean): HTMLButtonElement {
   const content = document.createElement('button');
   content.type = 'button';
-  content.className = `trip-map-place-card${selected ? ' trip-map-place-card--selected' : ''}`;
+  content.className = `trip-map-pin${selected ? ' trip-map-pin--selected' : ''}`;
   content.setAttribute('aria-pressed', String(selected));
+  content.style.setProperty('--pin-color', tripMapMarkerColor(index));
   const order = document.createElement('span');
-  order.className = 'trip-map-place-card__order';
+  order.className = 'trip-map-pin__dot';
   order.textContent = String(index + 1);
-  const body = document.createElement('span');
-  body.className = 'trip-map-place-card__body';
   const name = document.createElement('span');
-  name.className = 'trip-map-place-card__name';
+  name.className = 'trip-map-pin__label';
   name.textContent = stop.name;
-  const meta = document.createElement('span');
-  meta.className = 'trip-map-place-card__meta';
-  meta.textContent = `${stop.startTime ?? '时间待定'} · ${TRIP_PLACE_TYPE_LABELS[stop.type]}`;
-  body.append(name, meta);
-  content.append(order, body);
+  content.append(order, name);
   content.setAttribute('aria-label', `${index + 1}. ${stop.name}`);
   return content;
 }
 
 export function TripMap({
+  trip,
   day,
   places,
   selectedTripPlaceId,
   onStopSelect,
   focusTripPlaceId,
   onFocusHandled,
+  layoutSignal,
 }: TripMapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<AMap.Map | undefined>(undefined);
   const markersRef = useRef<AMap.Marker[]>([]);
+  const polylinesRef = useRef<AMap.Polyline[]>([]);
   const markerClickBindingsRef = useRef<MarkerClickBinding[]>([]);
   const markerByTripPlaceIdRef = useRef<Map<string, AMap.Marker>>(new Map());
   const handledFocusRef = useRef<string | null>(null);
@@ -79,6 +83,10 @@ export function TripMap({
   const stops = useMemo(
     () => resolveTripMapStops(day, places),
     [day, places],
+  );
+  const routes = useMemo(
+    () => resolveTripMapRoutes(trip, day.id),
+    [trip, day.id],
   );
 
   useEffect(() => {
@@ -124,6 +132,10 @@ export function TripMap({
           map.remove(markersRef.current);
           markersRef.current = [];
         }
+        if (polylinesRef.current.length > 0) {
+          map.remove(polylinesRef.current);
+          polylinesRef.current = [];
+        }
         map.destroy();
       }
       if (mapRef.current === map) {
@@ -145,19 +157,35 @@ export function TripMap({
       markerClickBindingsRef.current = [];
       map.remove(markersRef.current);
     }
+    if (polylinesRef.current.length > 0) {
+      map.remove(polylinesRef.current);
+      polylinesRef.current = [];
+    }
+
+    const polylines = routes.map((route) => new AMapApi.Polyline({
+      path: route.polyline.map((point) => [point.longitude, point.latitude] as const),
+      strokeColor: TRIP_MAP_ROUTE_COLOR,
+      strokeWeight: 5,
+      strokeOpacity: 0.92,
+      zIndex: 12,
+    }));
+    polylinesRef.current = polylines;
+    if (polylines.length > 0) {
+      map.add(polylines);
+    }
 
     const markerClickBindings: MarkerClickBinding[] = [];
     const markerByTripPlaceId = new Map<string, AMap.Marker>();
     const markers = stops.map((stop, index) => {
       const selected = stop.tripPlaceId === selectedTripPlaceId;
-      const content = createPlaceCard(stop, index, selected);
+      const content = createPlacePin(stop, index, selected);
       const marker = new AMapApi.Marker({
         position: [stop.position.longitude, stop.position.latitude],
         title: stop.name,
         content,
-        anchor: 'bottom-left',
-        offset: new AMapApi.Pixel(index * 10, -index * 8),
-        zIndex: selected ? 40 + index : 20 + index,
+        anchor: 'center',
+        offset: new AMapApi.Pixel(0, 0),
+        zIndex: selected ? 48 + index : 24 + index,
       });
       if (onStopSelect) {
         const handler = () => onStopSelect(stop.tripPlaceId);
@@ -173,7 +201,7 @@ export function TripMap({
 
     if (markers.length > 0) {
       map.add(markers);
-      map.setFitView(markers, true, [48, 48, 120, 48], 15);
+      restoreTripMapViewport(map, [...polylines, ...markers]);
     }
 
     return () => {
@@ -186,8 +214,12 @@ export function TripMap({
         markerClickBindingsRef.current = [];
         markerByTripPlaceIdRef.current.clear();
       }
+      if (polylinesRef.current === polylines && polylines.length > 0) {
+        map.remove(polylines);
+        polylinesRef.current = [];
+      }
     };
-  }, [status, stops, selectedTripPlaceId, onStopSelect]);
+  }, [status, stops, routes, selectedTripPlaceId, onStopSelect]);
 
   useEffect(() => {
     if (!focusTripPlaceId) {
@@ -217,10 +249,71 @@ export function TripMap({
     onFocusHandled?.(focusTripPlaceId);
   }, [focusTripPlaceId, onFocusHandled, status, stops]);
 
+  useEffect(() => {
+    if (status !== 'ready') {
+      return;
+    }
+    const map = mapRef.current;
+    const canvas = containerRef.current;
+    if (!map || !canvas) {
+      return;
+    }
+
+    let frame: number | null = null;
+    let cancelled = false;
+    const restoreIfVisible = () => {
+      if (cancelled || !isUsableMapContainer(canvas)) {
+        return;
+      }
+      restoreTripMapViewport(map, [...polylinesRef.current, ...markersRef.current]);
+    };
+
+    const scheduleRestore = () => {
+      if (cancelled || frame !== null) {
+        return;
+      }
+      frame = window.requestAnimationFrame(() => {
+        frame = window.requestAnimationFrame(() => {
+          frame = null;
+          restoreIfVisible();
+        });
+      });
+    };
+
+    scheduleRestore();
+    const observer = typeof ResizeObserver === 'function'
+      ? new ResizeObserver(scheduleRestore)
+      : undefined;
+    observer?.observe(canvas);
+    window.addEventListener('orientationchange', scheduleRestore);
+    const viewport = window.visualViewport;
+    viewport?.addEventListener('resize', scheduleRestore);
+    viewport?.addEventListener('scroll', scheduleRestore);
+    return () => {
+      cancelled = true;
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+      }
+      observer?.disconnect();
+      window.removeEventListener('orientationchange', scheduleRestore);
+      viewport?.removeEventListener('resize', scheduleRestore);
+      viewport?.removeEventListener('scroll', scheduleRestore);
+    };
+  }, [status, layoutSignal, day.id]);
+
+  const overlay = dayWorkspaceSummary(trip, day);
+  const overlayText = formatDayWorkspaceSummary({
+    placeCount: stops.length,
+    transitMinutes: overlay.transitMinutes,
+  });
+  const overlayTitle = overlay.transitMinutes === undefined ? '今日地点' : '今日路线';
+  const currentStop = stops.find((stop) => stop.tripPlaceId === selectedTripPlaceId)
+    ?? stops[0];
+  const currentName = visibleUserText(currentStop?.name);
   const missingCount = day.places.length - stops.length;
 
   return (
-    <section className="trip-map" aria-label={`Day ${day.dayNumber} 地图`}>
+    <section className="trip-map" aria-label={`Day ${day.dayNumber} 地图`} data-trip-map="primary">
       <div className="trip-map__frame">
         <div
           className="trip-map__canvas"
@@ -250,16 +343,16 @@ export function TripMap({
             <p className="state-message">这一天暂时没有可显示的地点</p>
           </div>
         )}
-        {status === 'ready' && stops.length > 0 && (
+        {status === 'ready' && stops.length > 0 && overlayText && (
           <div className="trip-map__summary">
-            <strong>今日地点</strong>
-            <span>{stops.length} 个地点</span>
+            <div>
+              <strong>{overlayTitle}</strong>
+              <span>{overlayText}</span>
+            </div>
+            {currentName && <p className="trip-map__summary-current">当前：{currentName}</p>}
           </div>
         )}
       </div>
-      {status === 'ready' && stops.length > 0 && (
-        <p className="trip-map__hint">点击地点卡片，在行程中查看详情</p>
-      )}
       {status === 'ready' && missingCount > 0 && stops.length > 0 && (
         <p className="trip-map__notice">
           部分地点暂无坐标，地图仅显示可定位的行程地点。

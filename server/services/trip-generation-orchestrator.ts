@@ -21,11 +21,14 @@ import {
   dayNeedsCorePlaceCompletion,
 } from './trip-core-place-completion-resolver';
 import { isCoreTripPlace } from './trip-day-density-planner';
+import { shadowEvaluateGeneratedDayCombinationsV1 } from './trip-day-combination-evaluator-v1';
+import { shadowEvaluateGeneratedTripStyleFulfillmentV1 } from './trip-style-fulfillment-audit-v1';
 import { validateDayItineraryCompleteness } from './trip-itinerary-completeness-validator';
 import type { PlaceSearchService } from './trip-place-resolver';
 import { applyResolvedTripStopDurations } from './trip-stop-duration-resolver';
 import { scheduleEnrichedTripTimes, TripTimeScheduleError } from './trip-time-scheduler';
 import type { Place, Trip } from '../../src/domain/trip/types';
+import { buildPlanningPolicyV1, planningPolicyPromptSummary } from '../../src/services/travel-profile-policy';
 import {
   createGenerationRequestId,
   safeGenerationErrorCode,
@@ -39,12 +42,31 @@ export const TRIP_GENERATION_INCOMPLETE_MESSAGE = '暂时无法补全这一天�
 export const TRIP_GENERATION_TIMEOUT_MESSAGE = '行程生成时间较长，请稍后重试。';
 export const TRIP_GENERATION_BUDGET_MS = 105_000;
 
+function hasPlanningPreferences(
+  requirement: ConfirmedTripRequirement,
+  policy: ReturnType<typeof buildPlanningPolicyV1>,
+): boolean {
+  return (
+    hasExplicitTravelPreferences(requirement)
+    || policy.preferredInterestKeys.length > 0
+    || policy.excludedInterestKeys.length > 0
+  );
+}
+
 export class TripGenerationIncompleteError extends Error {
   readonly code = 'TRIP_GENERATION_INCOMPLETE' as const;
+  readonly validationReason?: string;
 
-  constructor(message = TRIP_GENERATION_INCOMPLETE_MESSAGE) {
+  constructor(init?: string | { validationReason?: string; message?: string }) {
+    const message = typeof init === 'string'
+      ? init
+      : init?.message ?? TRIP_GENERATION_INCOMPLETE_MESSAGE;
     super(message);
     this.name = 'TripGenerationIncompleteError';
+    const reason = typeof init === 'object' ? init?.validationReason : undefined;
+    if (reason && /^[A-Z][A-Z0-9_]{0,63}$/.test(reason)) {
+      this.validationReason = reason;
+    }
   }
 }
 
@@ -97,12 +119,12 @@ function assertResolvedCoverage(
   resolved: ResolvedTripPlanSuggestion,
 ): void {
   if (resolved.days.length !== requirement.durationDays) {
-    throw new TripGenerationIncompleteError();
+    throw new TripGenerationIncompleteError({ validationReason: 'INSUFFICIENT_CORE_PLACES' });
   }
   for (const [index, day] of resolved.days.entries()) {
     // Day fallback may have already filled a partial day; require the final stop count.
     if (day.dayNumber !== index + 1 || day.stops.length < 2) {
-      throw new TripGenerationIncompleteError();
+      throw new TripGenerationIncompleteError({ validationReason: 'INSUFFICIENT_CORE_PLACES' });
     }
   }
 }
@@ -231,8 +253,20 @@ export class ServerTripGenerationOrchestrator implements TripGenerationOrchestra
     };
 
     try {
+      const policy = buildPlanningPolicyV1({
+        profile: requirement.profileSignals,
+        tripIntent: requirement.tripIntent,
+        partyContext: requirement.partyContext,
+        constraints: requirement.constraints,
+        tripPace: requirement.pace,
+      });
+      const planRequirement: ConfirmedTripRequirement = {
+        ...requirement,
+        planningPolicySummary: planningPolicyPromptSummary(policy),
+      };
+      const usesPreferences = hasPlanningPreferences(requirement, policy);
       const suggestion = await runStage('plan', async () => {
-        const plan = await this.deps.planGenerator.generate(requirement, { signal: controller.signal });
+        const plan = await this.deps.planGenerator.generate(planRequirement, { signal: controller.signal });
         return plan;
       });
 
@@ -241,7 +275,7 @@ export class ServerTripGenerationOrchestrator implements TripGenerationOrchestra
           destination: requirement.destination,
           plan: suggestion,
           signal: controller.signal,
-          hasExplicitTravelPreferences: hasExplicitTravelPreferences(requirement),
+          hasExplicitTravelPreferences: usesPreferences,
         });
         assertResolvedCoverage(requirement, next);
         const withDurations = applyResolvedTripStopDurations(next, {
@@ -255,17 +289,25 @@ export class ServerTripGenerationOrchestrator implements TripGenerationOrchestra
           plan: withDurations,
           destination: requirement.destination,
           pace: requirement.pace,
+          policy,
           placeSearch: this.deps.placeSearch,
-          hasExplicitTravelPreferences: hasExplicitTravelPreferences(requirement),
+          hasExplicitTravelPreferences: usesPreferences,
           preferenceTerms: [
             ...(requirement.preferences?.interests ?? []),
             ...(requirement.preferences?.mustVisit ?? []),
-          ],
+            ...policy.preferredInterestKeys,
+          ].filter((term) => !policy.excludedInterestKeys.includes(term as never)),
+          scoringContext: {
+            profileSignals: requirement.profileSignals,
+            tripIntent: requirement.tripIntent,
+            partyContext: requirement.partyContext,
+            constraints: requirement.constraints,
+          },
           signal: controller.signal,
         });
         for (const day of completed.days) {
-          if (dayNeedsCorePlaceCompletion(day, requirement.pace)) {
-            throw new TripGenerationIncompleteError();
+          if (dayNeedsCorePlaceCompletion(day, requirement.pace, policy.targetCorePlacesPerDay)) {
+            throw new TripGenerationIncompleteError({ validationReason: 'INSUFFICIENT_CORE_PLACES' });
           }
         }
         return completed;
@@ -330,6 +372,9 @@ export class ServerTripGenerationOrchestrator implements TripGenerationOrchestra
           tripId: input.tripId,
           createdAt: input.createdAt,
           userId: this.deps.userId,
+          planningPolicy: {
+            targetCorePlacesPerDay: policy.targetCorePlacesPerDay,
+          },
         });
         for (const day of built.trip.days) {
           if (day.places.length === 0) {
@@ -337,15 +382,36 @@ export class ServerTripGenerationOrchestrator implements TripGenerationOrchestra
           }
           const completeness = validateDayItineraryCompleteness({
             pace: built.trip.pace,
+            targetCorePlacesPerDay: policy.targetCorePlacesPerDay,
             placeIds: new Set(day.places.map((place) => place.id)),
             corePlaceCount: day.places.filter((place) => isCoreTripPlace(place)).length,
             items: day.scheduleItems ?? [],
             places: day.places,
           });
           if (!completeness.valid) {
-            throw new TripGenerationIncompleteError();
+            throw new TripGenerationIncompleteError({
+              validationReason: completeness.reason,
+            });
           }
         }
+        shadowEvaluateGeneratedDayCombinationsV1({
+          trip: built.trip,
+          places: built.places,
+          policy,
+          profileSignals: requirement.profileSignals,
+          tripIntent: requirement.tripIntent,
+          partyContext: requirement.partyContext,
+          constraints: requirement.constraints,
+        });
+        shadowEvaluateGeneratedTripStyleFulfillmentV1({
+          trip: built.trip,
+          places: built.places,
+          policy,
+          planningContext: built.trip.planningContext,
+          tripIntent: requirement.tripIntent,
+          partyContext: requirement.partyContext,
+          constraints: requirement.constraints,
+        });
         return built;
       });
     } finally {

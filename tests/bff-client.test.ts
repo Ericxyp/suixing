@@ -341,8 +341,9 @@ test('allows interpret and apply relative POST paths and rejects protected field
   };
   const client = new BffHttpClient(fakeFetch);
   await client.post('/api/ai/trips/change/interpret', {
-    input: '换成颐和园',
-    context: { tripId: 'trip-1', destination: '北京', days: [] },
+    input: '不想去新天地换一个商场',
+    context: { tripId: 'trip-1', destination: '上海', days: [] },
+    focus: { selectedDayNumber: 1 },
   });
   await client.post('/api/trips/change/apply', {
     trip: { id: 'trip-1' },

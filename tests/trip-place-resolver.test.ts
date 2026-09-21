@@ -1099,6 +1099,50 @@ test('classic-route fallback still fills after one provider error on the same da
   assert.equal(search.calls.some((call) => call.query === '北京景点'), true);
 });
 
+test('resolver rejects hotel suggestions at the plan boundary', async () => {
+  const search = new FakePlaceSearch(async () => [
+    place({ id: 'amap:HOTEL', name: '如家酒店', category: 'hotel' }),
+  ]);
+  const resolver = new AmapTripPlaceResolver(search);
+  await assert.rejects(
+    () => resolver.resolve({
+      destination: '北京',
+      plan: planWithQueries([[suggestion('如家酒店', 'hotel'), suggestion('天坛公园')]]),
+    }),
+    (error: unknown) => error instanceof AmapProviderError && error.code === 'INVALID_REQUEST',
+  );
+  assert.equal(search.calls.length, 0);
+});
+
+test('selectPlaceCandidate never returns a hotel POI', () => {
+  const inn = place({ id: 'amap:HOTEL', name: '如家酒店', category: 'hotel' });
+  const park = place({ id: 'amap:PARK', name: '天坛公园' });
+  assert.equal(selectPlaceCandidate([inn], suggestion('如家酒店', 'hotel'), new Set()), 'NO_MATCH');
+  const selected = selectPlaceCandidate([inn, park], suggestion('天坛公园'), new Set());
+  assert.equal(typeof selected === 'object' ? selected.id : selected, park.id);
+});
+
+test('day fallback does not search or select hotels', async () => {
+  const search = new FakePlaceSearch(async (input) => {
+    if (input.query === '失踪地点' || input.query === '失踪地点乙') {
+      return [];
+    }
+    return [
+      place({ id: 'amap:HOTEL', name: '如家酒店', category: 'hotel' }),
+      place({ id: 'amap:PARK', name: '天坛公园' }),
+      place({ id: 'amap:TEMPLE', name: '太庙', latitude: 39.91, longitude: 116.394 }),
+    ];
+  });
+  const resolver = new AmapTripPlaceResolver(search);
+  const resolved = await resolver.resolve({
+    destination: '北京',
+    plan: planWithQueries([[suggestion('失踪地点'), suggestion('失踪地点乙')]]),
+  });
+  assert.equal(search.calls.some((call) => call.query.includes('酒店')), false);
+  assert.equal(resolved.days[0].stops.some((stop) => stop.place.category === 'hotel'), false);
+  assert.equal(dayFallbackQueries('北京', [suggestion('如家酒店', 'hotel')], 3).includes('北京酒店'), false);
+});
+
 test('classic-route provider errors still skip default fallback', async () => {
   const search = new FakePlaceSearch(async (input) => {
     if (input.query === '超时地点' || input.query === '超时地点乙') {

@@ -1,0 +1,4 @@
+export const HIGH_WALKING_BURDEN_V1 = 0.65;
+export const LONG_CORE_STAY_MINUTES_V1 = 150;
+export const HEAVY_CORE_DAY_MINUTES_V1 = 240;
+export const MAX_FATIGUE_PENALTY_V1 = 20;

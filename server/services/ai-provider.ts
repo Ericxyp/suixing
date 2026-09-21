@@ -61,7 +61,7 @@ const MAX_OUTPUT_TOKENS = 8_192;
 const JSON_SCHEMA_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 const MAX_JSON_SCHEMA_TEXT = 8_000;
 const MAX_JSON_SCHEMA_DEPTH = 12;
-const MAX_JSON_SCHEMA_NODES = 120;
+const MAX_JSON_SCHEMA_NODES = 280;
 const MAX_JSON_SCHEMA_STRING = 200;
 
 function isRecord(value: unknown): value is Record<string, unknown> {

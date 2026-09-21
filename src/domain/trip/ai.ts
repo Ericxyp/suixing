@@ -1,4 +1,11 @@
 import type { TripChangeOperation } from './trip-change';
+import type {
+  PartyContextV1,
+  TravelProfilePatchV1,
+  TravelProfileSignals,
+  TripConstraintsV1,
+  TripIntentV1,
+} from './profile';
 import type { Place, TripDiningMode, TripPace, TripPreference } from './types';
 
 export interface TripRequirementDraft {
@@ -12,6 +19,11 @@ export interface TripRequirementDraft {
   pace?: TripPace;
   diningMode?: TripDiningMode;
   preferences?: TripPreference;
+  tripIntent?: TripIntentV1;
+  partyContext?: PartyContextV1;
+  constraints?: TripConstraintsV1;
+  profilePatch?: TravelProfilePatchV1;
+  longTermProfileSignals?: TravelProfileSignals;
 }
 
 export interface RequirementFieldIssue {

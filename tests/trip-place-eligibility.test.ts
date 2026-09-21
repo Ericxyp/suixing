@@ -53,9 +53,17 @@ test('maps suggestion categories onto existing Place.category values', () => {
   assert.deepEqual([...allowedPlaceCategoriesForSuggestion('food')], ['restaurant']);
   assert.deepEqual([...allowedPlaceCategoriesForSuggestion('coffee')], ['cafe']);
   assert.deepEqual([...allowedPlaceCategoriesForSuggestion('shopping')], ['shopping']);
-  assert.deepEqual([...allowedPlaceCategoriesForSuggestion('hotel')], ['hotel']);
+  assert.deepEqual([...allowedPlaceCategoriesForSuggestion('hotel')], []);
   assert.deepEqual([...allowedPlaceCategoriesForSuggestion('sight')].sort(), ['activity', 'attraction']);
   assert.deepEqual([...allowedPlaceCategoriesForSuggestion('other')].sort(), ['activity', 'attraction']);
+});
+
+test('hotel places and hotel suggestions are never eligible for new writes', () => {
+  const inn = place({ id: 'amap:HOTEL', name: '如家酒店', category: 'hotel' });
+  assert.equal(evaluateTripPlaceEligibility(inn, suggestion('如家酒店', 'hotel')).eligible, false);
+  assert.equal(evaluateTripPlaceEligibility(inn, suggestion('故宫博物院')).eligible, false);
+  assert.equal(evaluateTripPlaceEligibility(inn, suggestion('如家酒店', 'hotel')).reason, 'CATEGORY_MISMATCH');
+  assert.deepEqual(filterEligibleTripPlaces([inn], suggestion('如家酒店', 'hotel')), []);
 });
 
 test('sight intent rejects restaurants and cafes', () => {

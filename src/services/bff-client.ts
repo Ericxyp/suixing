@@ -252,12 +252,23 @@ export class BffHttpClient implements BffClient {
     if (path === '/api/ai/trips/change/interpret') {
       const keys = Object.keys(body);
       if (
-        keys.length !== 2
-        || typeof body.input !== 'string'
+        typeof body.input !== 'string'
         || !isRecord(body.context)
+        || keys.some((key) => key !== 'input' && key !== 'context' && key !== 'focus')
+        || !keys.includes('input')
+        || !keys.includes('context')
         || containsForbiddenKey(body)
       ) {
         throw new BffClientError('INVALID_REQUEST', INVALID_REQUEST_MESSAGE);
+      }
+      if ('focus' in body) {
+        if (!isRecord(body.focus)) {
+          throw new BffClientError('INVALID_REQUEST', INVALID_REQUEST_MESSAGE);
+        }
+        const focusKeys = Object.keys(body.focus);
+        if (focusKeys.some((key) => key !== 'selectedDayNumber' && key !== 'sourceTripPlaceId')) {
+          throw new BffClientError('INVALID_REQUEST', INVALID_REQUEST_MESSAGE);
+        }
       }
     }
 

@@ -5,6 +5,12 @@ import type {
 } from '../domain/trip/ai';
 import type { TripPace, TripPreference } from '../domain/trip/types';
 import {
+  parsePartyContextV1,
+  parseTravelProfilePatchV1,
+  parseTripConstraintsV1,
+  parseTripIntentV1,
+} from '../domain/trip/profile';
+import {
   BffClientError,
   BffHttpClient,
   DEFAULT_POST_TIMEOUT_MS,
@@ -29,6 +35,10 @@ const DRAFT_KEYS = new Set([
   'totalBudget',
   'pace',
   'preferences',
+  'tripIntent',
+  'partyContext',
+  'constraints',
+  'profilePatch',
 ]);
 const PREFERENCE_KEYS = new Set([
   'interests',
@@ -162,6 +172,26 @@ function readDraft(value: unknown): TripRequirementDraft {
   if (travelerCount !== undefined) draft.travelerCount = travelerCount;
   if (totalBudget !== undefined) draft.totalBudget = totalBudget;
   if (preferences !== undefined) draft.preferences = preferences;
+  const tripIntent = parseTripIntentV1(value.tripIntent);
+  if (value.tripIntent !== undefined && value.tripIntent !== null && !tripIntent) {
+    invalidResponse();
+  }
+  if (tripIntent) draft.tripIntent = tripIntent;
+  const partyContext = parsePartyContextV1(value.partyContext);
+  if (value.partyContext !== undefined && value.partyContext !== null && !partyContext) {
+    invalidResponse();
+  }
+  if (partyContext) draft.partyContext = partyContext;
+  const constraints = parseTripConstraintsV1(value.constraints);
+  if (value.constraints !== undefined && value.constraints !== null && !constraints) {
+    invalidResponse();
+  }
+  if (constraints) draft.constraints = constraints;
+  const profilePatch = parseTravelProfilePatchV1(value.profilePatch);
+  if (value.profilePatch !== undefined && value.profilePatch !== null && !profilePatch) {
+    invalidResponse();
+  }
+  if (profilePatch) draft.profilePatch = profilePatch;
   return draft;
 }
 

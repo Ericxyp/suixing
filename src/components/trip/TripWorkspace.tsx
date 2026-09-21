@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Place, Trip, TripDay, TripPlaceType, TripScheduleItem } from '../../domain/trip/types';
-import { formatCurrency, formatDistance, formatDuration, formatTripDates, getDefaultTripDayId, itineraryTimelineItems, statusLabel } from '../../services/trip-display';
+import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
+import type { Place, Trip, TripScheduleItem } from '../../domain/trip/types';
+import { getDefaultTripDayId } from '../../services/trip-display';
+import { isWorkspaceSplitViewport } from '../../services/trip-workspace-layout';
 import {
   getTripMapStopByTripPlaceId,
   isTripPlaceInDay,
@@ -12,19 +13,23 @@ import {
 import { isReadyReplaceIntent } from '../../services/bff-trip-change-service';
 import {
   ASK_SUIXING_BREAKPOINT_PX,
+  assistantLayoutForViewport,
   beginApply,
   beginInterpret,
   canSubmitAssistant,
   closeAssistant,
   createAssistantUiState,
+  discardAssistantPlaceContext,
   markApplied,
   markFailed,
   openAssistant,
-  sheetLayoutForWidth,
+  restoreFailedDraft,
+  showChoices,
   showClarification,
 } from '../../services/trip-assistant-session';
 import {
   noticeForTripChangeError,
+  isSemanticTripChangeError,
   tripChangeService,
   TRIP_CHANGE_SAVE_FAILED_NOTICE,
   TRIP_CHANGE_STALE_NOTICE,
@@ -34,11 +39,19 @@ import type { ReplacePlaceSummary } from '../../services/bff-trip-change-service
 import type { SelectMealPlaceSummary } from '../../services/bff-trip-meal-service';
 import { tripMealService, type BffTripMealService } from '../../services/bff-trip-meal-service';
 import { TripMap } from './TripMap';
+import { TripMapRail } from './TripMapRail';
 import { AskSuixingButton } from './AskSuixingButton';
 import { TripAssistantSheet } from './TripAssistantSheet';
-
-const typeLabels: Record<TripPlaceType, string> = { hotel: '酒店', attraction: '景点', restaurant: '餐厅', cafe: '咖啡', transport: '交通', shopping: '购物', activity: '活动' };
-const transportLabels = { walk: '步行', metro: '地铁', taxi: '打车', bus: '公交', drive: '驾车' };
+import { TripHero } from './TripHero';
+import { TripDaySwitcher } from './TripDaySwitcher';
+import { ItineraryTimeline } from './ItineraryTimeline';
+import { MealOptionsSheet } from './MealOptionsSheet';
+import { MEAL_APPLY_FAILED_NOTICE } from '../../services/meal-options-display';
+import { subscribeKeyboardInset } from '../../services/mobile-viewport';
+import {
+  askSuixingExamples,
+  askSuixingPlaceholder,
+} from '../../services/ask-suixing-display';
 
 export function TripWorkspace({
   trip,
@@ -68,11 +81,17 @@ export function TripWorkspace({
     places: Place[];
     status: 'loading' | 'ready' | 'empty' | 'error';
     category: 'nearby' | 'coffee';
+    applyingPlaceId?: string | null;
+    applyError?: string | null;
   }>(null);
   const [assistant, setAssistant] = useState(() => createAssistantUiState(
-    typeof window === 'undefined' ? 'side' : sheetLayoutForWidth(window.innerWidth),
+    assistantLayoutForViewport(),
   ));
   const requestLock = useRef(false);
+  const askTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const mealTriggerRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => subscribeKeyboardInset().disconnect, []);
 
   useEffect(() => {
     setDayId(getDefaultTripDayId(trip));
@@ -81,6 +100,7 @@ export function TripWorkspace({
     setSelectionSource(null);
     setMapNotice(null);
     setMealSheet(null);
+    setAssistant((state) => createAssistantUiState(state.layout));
   }, [trip.id]);
 
   useEffect(() => {
@@ -116,6 +136,7 @@ export function TripWorkspace({
         retainSelectedTripPlaceId(day, selected));
       setSelectionSource(null);
       setMapNotice(null);
+      setAssistant((state) => discardAssistantPlaceContext(state));
     }
   }, [day?.id]);
 
@@ -141,7 +162,9 @@ export function TripWorkspace({
     setMapNotice(null);
     setSelectedTripPlaceId(tripPlaceId);
     setSelectionSource('timeline');
-    setView('map');
+    if (!isWorkspaceSplitViewport()) {
+      setView('map');
+    }
   }, [day, places]);
 
   const handleMapFocusHandled = useCallback((tripPlaceId: string) => {
@@ -182,9 +205,23 @@ export function TripWorkspace({
     requestLock.current = true;
     setAssistant((state) => beginInterpret(state, text));
     try {
-      const intent = await changeService.interpret(text, submittedTrip);
+      const intent = await changeService.interpret(text, submittedTrip, {
+        selectedDayNumber: day?.dayNumber,
+        sourceTripPlaceId: day?.places.some((place) => place.id === assistant.sessionHint?.sourceTripPlaceId)
+          ? assistant.sessionHint?.sourceTripPlaceId
+          : undefined,
+      });
+      if (intent.status === 'needs_choice') {
+        setAssistant((state) => showChoices(
+          state,
+          intent.summary,
+          intent.candidates ?? [],
+          intent.pendingReplace,
+        ));
+        return;
+      }
       if (intent.status === 'needs_clarification' || !isReadyReplaceIntent(intent)) {
-        setAssistant((state) => showClarification(state, intent.summary));
+        setAssistant((state) => showClarification(state, intent.summary, intent.sourceChoices ?? []));
         return;
       }
       setAssistant((state) => beginApply(state));
@@ -206,16 +243,18 @@ export function TripWorkspace({
         setAssistant((state) => markFailed(state, TRIP_CHANGE_SAVE_FAILED_NOTICE));
       }
     } catch (error) {
-      setAssistant((state) => markFailed(
-        state,
-        error instanceof Error && error.message === TRIP_CHANGE_STALE_NOTICE
-          ? TRIP_CHANGE_STALE_NOTICE
-          : noticeForTripChangeError(error),
+      const notice = error instanceof Error && error.message === TRIP_CHANGE_STALE_NOTICE
+        ? TRIP_CHANGE_STALE_NOTICE
+        : noticeForTripChangeError(error);
+      setAssistant((state) => (
+        isSemanticTripChangeError(error)
+          ? showClarification(state, notice)
+          : markFailed(state, notice)
       ));
     } finally {
       requestLock.current = false;
     }
-  }, [assistant, changeService, onCommitChange, places, trip]);
+  }, [assistant, changeService, day?.dayNumber, onCommitChange, places, trip]);
 
   const loadMealOptions = useCallback(async (
     slot: Extract<TripScheduleItem, { kind: 'meal_slot' }>,
@@ -234,7 +273,7 @@ export function TripWorkspace({
       ? day.places.find((place) => place.id === slot.nextTripPlaceId)
       : undefined;
     const nextMapped = nextStop ? places.find((place) => place.id === nextStop.placeId) : undefined;
-    setMealSheet({ slot, places: [], status: 'loading', category });
+    setMealSheet({ slot, places: [], status: 'loading', category, applyingPlaceId: null, applyError: null });
     try {
       const options = await mealService.listOptions({
         city: trip.destination,
@@ -262,6 +301,8 @@ export function TripWorkspace({
         places: options,
         status: options.length === 0 ? 'empty' : 'ready',
         category,
+        applyingPlaceId: null,
+        applyError: null,
       });
     } catch {
       setMealSheet({ slot, places: [], status: 'error', category });
@@ -269,10 +310,19 @@ export function TripWorkspace({
   }, [day, mealService, places, trip.destination]);
 
   const handleSelectMeal = useCallback(async (placeId: string) => {
-    if (!mealSheet || requestLock.current) {
+    if (!mealSheet || requestLock.current || mealSheet.applyingPlaceId) {
+      return;
+    }
+    if (!mealSheet.places.some((place) => place.id === placeId)) {
+      setMealSheet((current) => current
+        ? { ...current, applyingPlaceId: null, applyError: MEAL_APPLY_FAILED_NOTICE }
+        : current);
       return;
     }
     requestLock.current = true;
+    setMealSheet((current) => current
+      ? { ...current, applyingPlaceId: placeId, applyError: null }
+      : current);
     const previous = {
       trip: structuredClone(trip),
       places: structuredClone([...places]),
@@ -294,69 +344,188 @@ export function TripWorkspace({
       });
       setMealSheet(null);
     } catch {
-      setMealSheet((current) => current ? { ...current, status: 'error' } : current);
+      setMealSheet((current) => current
+        ? { ...current, applyingPlaceId: null, applyError: MEAL_APPLY_FAILED_NOTICE }
+        : current);
     } finally {
       requestLock.current = false;
     }
   }, [day?.dayNumber, mealService, mealSheet, onCommitChange, places, trip]);
 
+  const handleSelectCandidate = useCallback(async (candidate: {
+    placeId: string;
+    name: string;
+  }) => {
+    if (!canSubmitAssistant(assistant) || requestLock.current || !assistant.pendingReplace) {
+      return;
+    }
+    const submittedTrip = trip;
+    const submittedPlaces = [...places];
+    const expectedTripId = submittedTrip.id;
+    const operation = {
+      type: 'REPLACE_PLACE' as const,
+      dayNumber: assistant.pendingReplace.dayNumber,
+      targetTripPlaceId: assistant.pendingReplace.targetTripPlaceId,
+      replacementQuery: candidate.placeId,
+    };
+    requestLock.current = true;
+    setAssistant((state) => beginApply(state));
+    try {
+      const result = await changeService.apply({
+        trip: submittedTrip,
+        places: submittedPlaces,
+        operation,
+        expectedTripId,
+      });
+      try {
+        await onCommitChange({
+          trip: result.trip,
+          places: result.places,
+          summary: result.summary,
+          previous: { trip: submittedTrip, places: submittedPlaces },
+        });
+        setAssistant((state) => markApplied(state));
+      } catch {
+        setAssistant((state) => markFailed(state, TRIP_CHANGE_SAVE_FAILED_NOTICE));
+      }
+    } catch (error) {
+      setAssistant((state) => markFailed(state, noticeForTripChangeError(error)));
+    } finally {
+      requestLock.current = false;
+    }
+  }, [assistant, changeService, onCommitChange, places, trip]);
+
+  const openAsk = (event: MouseEvent<HTMLButtonElement>) => {
+    if (mealSheet?.applyingPlaceId) {
+      return;
+    }
+    askTriggerRef.current = event.currentTarget;
+    setMealSheet(null);
+    setAssistant((state) => openAssistant(state));
+  };
+
+  const closeAsk = () => {
+    setAssistant((state) => {
+      const next = closeAssistant(state);
+      if (state.open && !next.open) {
+        const trigger = askTriggerRef.current;
+        window.requestAnimationFrame(() => trigger?.focus());
+      }
+      return next;
+    });
+  };
+
+  const map = day ? (
+    <TripMap
+      trip={trip}
+      day={day}
+      places={places}
+      selectedTripPlaceId={selectedTripPlaceId}
+      onStopSelect={handleMapStopSelect}
+      focusTripPlaceId={
+        shouldFocusMapForSelection(selectionSource)
+          ? selectedTripPlaceId
+          : null
+      }
+      onFocusHandled={handleMapFocusHandled}
+      layoutSignal={view}
+    />
+  ) : null;
+
   return <section className="workspace">
-    <header className="trip-header"><p className="eyebrow">{trip.destination} · {statusLabel[trip.status]}</p><h1>{trip.title}</h1><p>{formatTripDates(trip)} · {trip.travelerCount} 人 · 预算 {formatCurrency(trip.totalBudget)}</p></header>
+    <TripHero trip={trip} />
     {!day ? <EmptyItinerary /> : <>
       <nav className="trip-nav" aria-label="旅行功能">
         <button type="button" aria-current={view === 'itinerary' ? 'page' : undefined} onClick={() => setView('itinerary')}>行程</button>
         <button type="button" aria-current={view === 'map' ? 'page' : undefined} onClick={() => setView('map')}>地图</button>
-        <span>预订（即将接入）</span>
+        <span aria-disabled="true">预订（即将接入）</span>
       </nav>
-      <div className="day-switcher" role="tablist" aria-label="行程日期">{trip.days.map((item) => <button role="tab" aria-selected={item.id === day.id} key={item.id} type="button" onClick={() => setDayId(item.id)}>Day {item.dayNumber}<small>{item.date}</small></button>)}</div>
-      {view === 'itinerary'
-        ? <Timeline
+      <TripDaySwitcher trip={trip} day={day} onSelect={setDayId} />
+      <div className={`day-workspace day-workspace--${view}`}>
+        <div className="day-workspace__timeline">
+          <ItineraryTimeline
+            trip={trip}
             day={day}
             selectedTripPlaceId={selectedTripPlaceId}
             mapNotice={mapNotice}
             onPlaceSelect={handleTimelinePlaceSelect}
-            onOpenMeal={(slot) => {
+            onOpenMeal={(slot, trigger) => {
+              if (assistant.open && !canSubmitAssistant(assistant)) {
+                return;
+              }
+              mealTriggerRef.current = trigger ?? null;
+              setAssistant((state) => closeAssistant(state));
               void loadMealOptions(slot, 'nearby');
             }}
           />
-        : <TripMap
-            trip={trip}
-            day={day}
-            places={places}
-            selectedTripPlaceId={selectedTripPlaceId}
-            onStopSelect={handleMapStopSelect}
-            focusTripPlaceId={
-              shouldFocusMapForSelection(selectionSource)
-                ? selectedTripPlaceId
-                : null
-            }
-            onFocusHandled={handleMapFocusHandled}
-          />}
+        </div>
+        <TripMapRail
+          map={map}
+          action={(
+            <AskSuixingButton
+              label="问随行 · 调整这一天"
+              onClick={openAsk}
+            />
+          )}
+        />
+      </div>
     </>}
-    <AskSuixingButton
-      onClick={() => setAssistant((state) => openAssistant(state))}
-    />
+    <div
+      className={[
+        'ask-suixing-entry-slot',
+        'ask-suixing-entry-slot--mobile',
+        assistant.open || mealSheet ? 'ask-suixing-entry-slot--hidden' : '',
+      ].filter(Boolean).join(' ')}
+    >
+      <AskSuixingButton
+        label="问随行 · 调整这一天"
+        onClick={openAsk}
+      />
+    </div>
     <TripAssistantSheet
       state={assistant}
-      onClose={() => setAssistant((state) => closeAssistant(state))}
+      trip={trip}
+      day={day}
+      examples={day ? askSuixingExamples(day) : []}
+      placeholder={day ? askSuixingPlaceholder(day) : '例如：把今天下午的博物馆换成公园'}
+      onClose={closeAsk}
       onDraftChange={(value) => setAssistant((state) => ({ ...state, draft: value, error: null }))}
+      onRestoreDraft={() => setAssistant((state) => restoreFailedDraft(state))}
+      onSelectCandidate={(candidate) => {
+        void handleSelectCandidate(candidate);
+      }}
+      onSelectSource={(choice) => setAssistant((state) => ({
+        ...state,
+        draft: `把「${choice.placeName}」换成`,
+        sessionHint: {
+          selectedDayNumber: day?.dayNumber,
+          sourceTripPlaceId: choice.tripPlaceId,
+        },
+      }))}
       onSubmit={() => {
         void handleSubmitChange();
       }}
     />
-    {mealSheet && (
+    {mealSheet && !assistant.open && (
       <MealOptionsSheet
         slot={mealSheet.slot}
         areaName={day?.places.find((place) => place.id === mealSheet.slot.areaTripPlaceId)?.placeName ?? '当前区域'}
         options={mealSheet.places}
         status={mealSheet.status}
         category={mealSheet.category}
+        applyingPlaceId={mealSheet.applyingPlaceId}
+        applyError={mealSheet.applyError}
         nextName={
           mealSheet.slot.nextTripPlaceId
             ? day?.places.find((place) => place.id === mealSheet.slot.nextTripPlaceId)?.placeName
             : undefined
         }
-        onClose={() => setMealSheet(null)}
+        onClose={() => {
+          setMealSheet(null);
+          const trigger = mealTriggerRef.current;
+          mealTriggerRef.current = null;
+          window.requestAnimationFrame(() => trigger?.focus());
+        }}
         onRetry={() => {
           void loadMealOptions(mealSheet.slot, mealSheet.category);
         }}
@@ -369,146 +538,6 @@ export function TripWorkspace({
       />
     )}
   </section>;
-}
-
-function Timeline({
-  day,
-  selectedTripPlaceId,
-  mapNotice,
-  onPlaceSelect,
-  onOpenMeal,
-}: {
-  day: TripDay;
-  selectedTripPlaceId?: string | null;
-  mapNotice?: string | null;
-  onPlaceSelect?: (tripPlaceId: string) => void;
-  onOpenMeal?: (slot: Extract<TripScheduleItem, { kind: 'meal_slot' }>) => void;
-}) {
-  if (!day.places.length) return <p className="state-message">这一天的行程还在准备中。</p>;
-  const items = itineraryTimelineItems(day);
-  const placeById = new Map(day.places.map((place) => [place.id, place]));
-  return <section className="timeline"><h2>{day.title ?? `Day ${day.dayNumber}`}</h2>{mapNotice && <p className="timeline-map-notice" role="status">{mapNotice}</p>}{items.map((item) => {
-    if (item.kind === 'rest' || item.kind === 'hotel_return' || item.kind === 'experience') {
-      return <div className={`timeline-item timeline-item--experience${item.kind === 'rest' || item.kind === 'hotel_return' ? ' timeline-item--rest' : ''}`} key={item.id}>
-        <time>{item.startTime}</time>
-        <div>
-          <h3>{item.title}</h3>
-          <p>{item.description}</p>
-        </div>
-      </div>;
-    }
-    if (item.kind === 'area_walk') {
-      const optionNames = item.optionTripPlaceIds
-        .map((id) => placeById.get(id)?.placeName)
-        .filter((name): name is string => Boolean(name));
-      return <div className="timeline-item timeline-item--experience" key={item.id}>
-        <time>{item.startTime}</time>
-        <div>
-          <h3>{item.title}</h3>
-          <p>{item.description}</p>
-          {optionNames.length > 0 && <p>可选顺路点：{optionNames.join('、')}</p>}
-        </div>
-      </div>;
-    }
-    if (item.kind === 'meal_slot') {
-      const area = placeById.get(item.areaTripPlaceId);
-      const next = item.nextTripPlaceId ? placeById.get(item.nextTripPlaceId) : undefined;
-      const period = item.mealPeriod === 'lunch' ? '午餐时间' : '晚餐时间';
-      return <div className="timeline-item timeline-item--meal-slot" key={item.id}>
-        <time>{item.startTime}</time>
-        <div>
-          <h3>{period} · {area?.placeName ?? '当前区域'}附近</h3>
-          <p>预留 {formatDuration(item.durationMinutes)}</p>
-          {next && <p>位于当前安排与{next.placeName}之间</p>}
-          {item.diningMode === 'flexible' && onOpenMeal && (
-            <button className="timeline-meal-action" type="button" onClick={() => onOpenMeal(item)}>看看吃什么</button>
-          )}
-        </div>
-      </div>;
-    }
-    const tripPlaceId = item.tripPlaceId;
-    const place = placeById.get(tripPlaceId);
-    if (!place) {
-      return null;
-    }
-    const selected = place.id === selectedTripPlaceId;
-    const mealLabel = (item.kind === 'meal' || item.kind === 'meal_place')
-      ? (item.mealPeriod === 'lunch' ? '午餐' : '晚餐')
-      : typeLabels[place.type];
-    return <div
-      className={`timeline-item${selected ? ' timeline-item--selected' : ''}`}
-      data-selected={selected || undefined}
-      id={`trip-stop-${place.id}`}
-      key={`${item.kind}-${place.id}`}
-      tabIndex={-1}
-    ><time>{place.startTime ?? item.startTime ?? '时间待定'}</time><div><div className="timeline-item__heading"><h3>{place.placeName}</h3>{onPlaceSelect && <button className="timeline-map-action" type="button" aria-label={`在地图查看 ${place.placeName}`} onClick={() => onPlaceSelect(place.id)}>在地图查看</button>}</div><p>{mealLabel}{place.durationMinutes ? ` · 建议停留 ${formatDuration(place.durationMinutes)}` : ''}</p>{place.description && <p>{place.description}</p>}{place.estimatedCost > 0 && <p>人均约 {formatCurrency(place.estimatedCost)}</p>}{place.transportToNext && <p className="transport">↓ {transportLabels[place.transportToNext.mode]} {formatDuration(place.transportToNext.durationMinutes)} · {formatDistance(place.transportToNext.distanceMeters)}</p>}</div></div>;
-  })}</section>;
-}
-
-function MealOptionsSheet({
-  slot,
-  areaName,
-  options,
-  status,
-  category,
-  nextName,
-  onClose,
-  onRetry,
-  onFilter,
-  onSelect,
-}: {
-  slot: Extract<TripScheduleItem, { kind: 'meal_slot' }>;
-  areaName: string;
-  options: Place[];
-  status: 'loading' | 'ready' | 'empty' | 'error';
-  category: 'nearby' | 'coffee';
-  nextName?: string;
-  onClose: () => void;
-  onRetry: () => void;
-  onFilter: (category: 'nearby' | 'coffee') => void;
-  onSelect: (placeId: string) => void;
-}) {
-  const title = `${slot.mealPeriod === 'lunch' ? '午餐' : '晚餐'} · ${areaName}附近`;
-  return (
-    <div className="ask-suixing-layer ask-suixing-layer--side">
-      <button className="ask-suixing-dismiss" type="button" aria-label="关闭餐饮选项" onClick={onClose} />
-      <aside className="ask-suixing-sheet ask-suixing-sheet--side meal-options-sheet" role="dialog" aria-labelledby="meal-options-title">
-        <header className="ask-suixing-sheet__header">
-          <div>
-            <p className="eyebrow">用餐安排</p>
-            <h2 id="meal-options-title">{title}</h2>
-          </div>
-          <button type="button" onClick={onClose}>关闭</button>
-        </header>
-        <div className="meal-options-filters">
-          <button type="button" aria-pressed={category === 'nearby'} onClick={() => onFilter('nearby')}>附近餐饮</button>
-          <button type="button" aria-pressed={category === 'coffee'} onClick={() => onFilter('coffee')}>咖啡休息</button>
-        </div>
-        <div className="ask-suixing-sheet__stream">
-          {status === 'loading' && <p className="ask-suixing-sheet__status" role="status">正在查找附近餐饮…</p>}
-          {status === 'error' && (
-            <p className="ask-suixing-sheet__status" role="status">
-              暂时无法加载餐饮地点，请稍后重试。
-              {' '}
-              <button type="button" onClick={onRetry}>重试</button>
-            </p>
-          )}
-          {status === 'empty' && (
-            <p className="ask-suixing-sheet__empty">附近暂时没有合适的餐饮地点，你可以按自己的安排用餐。</p>
-          )}
-          {status === 'ready' && options.map((place) => (
-            <div className="meal-option" key={place.id}>
-              <div>
-                <h3>{place.name}</h3>
-                <p>{typeLabels[place.category]}{nextName ? ` · 顺路前往${nextName}` : ' · 靠近当前区域'}</p>
-              </div>
-              <button type="button" onClick={() => onSelect(place.id)}>加入行程</button>
-            </div>
-          ))}
-        </div>
-      </aside>
-    </div>
-  );
 }
 
 function EmptyItinerary() {

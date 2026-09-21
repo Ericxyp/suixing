@@ -18,6 +18,13 @@ import type {
 } from '../domain/trip/types';
 import type { CreateTripInput } from '../repositories/trip-repository';
 import {
+  parsePartyContextV1,
+  parseTravelProfileSignals,
+  parseTripConstraintsV1,
+  parseTripIntentV1,
+  parseTripPlanningContextV1,
+} from '../domain/trip/profile';
+import {
   BffClientError,
   BffHttpClient,
   type FetchLike,
@@ -73,6 +80,10 @@ const REQUIREMENT_KEYS = new Set([
   'totalBudget',
   'pace',
   'preferences',
+  'tripIntent',
+  'partyContext',
+  'constraints',
+  'profileSignals',
 ]);
 const CLOCK_TIME = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 const EXPERIENCE_TYPES = new Set<TripExperienceType>(['meal', 'walk', 'free_time', 'night', 'rest']);
@@ -435,6 +446,13 @@ function readTrip(value: unknown): Trip {
   if (origin !== undefined) trip.origin = origin;
   if (startDate !== undefined) trip.startDate = startDate;
   if (endDate !== undefined) trip.endDate = endDate;
+  if (value.planningContext !== undefined) {
+    const planningContext = parseTripPlanningContextV1(value.planningContext);
+    if (!planningContext) {
+      invalidResponse();
+    }
+    trip.planningContext = planningContext;
+  }
   return trip;
 }
 
@@ -607,6 +625,22 @@ export function toTripGenerationRequirement(
   }
   if (requirements.preferences) {
     requirement.preferences = structuredClone(requirements.preferences);
+  }
+  if (requirements.tripIntent) {
+    requirement.tripIntent = structuredClone(requirements.tripIntent);
+  }
+  if (requirements.partyContext) {
+    requirement.partyContext = structuredClone(requirements.partyContext);
+  }
+  if (requirements.constraints) {
+    requirement.constraints = structuredClone(requirements.constraints);
+  }
+  if (requirements.profileSignals) {
+    const signals = parseTravelProfileSignals(requirements.profileSignals);
+    if (!signals) {
+      return undefined;
+    }
+    requirement.profileSignals = signals;
   }
   for (const key of Object.keys(requirement)) {
     if (!REQUIREMENT_KEYS.has(key)) {

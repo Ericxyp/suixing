@@ -80,7 +80,7 @@ export function allowedPlaceCategoriesForSuggestion(
     return new Set(['shopping']);
   }
   if (suggestionCategory === 'hotel') {
-    return new Set(['hotel']);
+    return new Set();
   }
   return SIGHTSEEING_CATEGORIES;
 }
@@ -140,6 +140,9 @@ export function evaluateTripPlaceEligibility(
   place: Place,
   suggestion: TripPlaceSuggestion,
 ): TripPlaceEligibilityDecision {
+  if (place.category === 'hotel' || suggestion.category === 'hotel') {
+    return { eligible: false, kind: 'INELIGIBLE', reason: 'CATEGORY_MISMATCH' };
+  }
   if (isTransitOrServicePlace(place, suggestion)) {
     return { eligible: false, kind: 'INELIGIBLE', reason: 'TRANSIT_OR_SERVICE' };
   }

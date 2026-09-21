@@ -75,7 +75,10 @@ export function createApp(config: ServerConfig, options: AppOptions = {}): Expre
   app.use('/api', createPlaceDetailRouter(options.placeSearchService));
   app.use('/api', createRoutePlanningRouter(options.routeService));
   app.use('/api', createAiRequirementsRouter(options.tripRequirementExtractor));
-  app.use('/api', createAiTripChangeInterpretRouter(options.tripChangeIntentExtractor));
+  app.use('/api', createAiTripChangeInterpretRouter(
+    options.tripChangeIntentExtractor,
+    options.placeSearchService,
+  ));
   app.use('/api', createAiTripPlanRouter(options.tripPlanGenerator));
   app.use('/api', createTripGenerateRouter(
     options.tripGenerationOrchestrator,

@@ -11,7 +11,7 @@ import type {
   TripPlaceSuggestion,
 } from './trip-plan-generator';
 
-export type PlaceSearchService = Pick<AmapPlaceService, 'search'>;
+export type PlaceSearchService = Pick<AmapPlaceService, 'search'> & Partial<Pick<AmapPlaceService, 'getByProviderPlaceId'>>;
 
 export type UnresolvedTripPlaceReason =
   | 'NO_MATCH'
@@ -105,7 +105,7 @@ const DAY_FALLBACK_SUFFIX: Record<TripPlanPlaceCategory, string> = {
   coffee: '咖啡馆',
   food: '美食',
   shopping: '商场',
-  hotel: '酒店',
+  hotel: '景点',
   other: '景点',
 };
 
@@ -224,6 +224,10 @@ export function dayFallbackQueries(
     return queries;
   }
   for (const suggestion of unmatchedSuggestions) {
+    if (suggestion.category === 'hotel') {
+      add(`${city}景点`);
+      continue;
+    }
     add(dayFallbackQuery(destination, suggestion.category));
   }
   for (const label of CLASSIC_CITY_FALLBACK_LABELS) {
@@ -304,9 +308,6 @@ function categoryForFallbackQuery(query: string, destination: string): TripPlanP
   }
   if (query === `${city}商场`) {
     return 'shopping';
-  }
-  if (query === `${city}酒店`) {
-    return 'hotel';
   }
   return 'sight';
 }
@@ -395,7 +396,6 @@ function readPlaceSuggestion(value: unknown): TripPlaceSuggestion {
     category !== 'sight'
     && category !== 'food'
     && category !== 'coffee'
-    && category !== 'hotel'
     && category !== 'shopping'
     && category !== 'activity'
     && category !== 'other'
@@ -688,6 +688,9 @@ export function selectPlaceCandidate(
   usedPlaceIds: ReadonlySet<string>,
   context: SelectPlaceCandidateContext = {},
 ): Place | 'NO_MATCH' | 'DUPLICATE_MATCH' {
+  if (suggestion.category === 'hotel') {
+    return 'NO_MATCH';
+  }
   if (places.length === 0) {
     return 'NO_MATCH';
   }
@@ -712,6 +715,9 @@ function toStop(
   selected: Place,
   resolutionSource: NonNullable<ResolvedTripPlaceStop['resolutionSource']>,
 ): ResolvedTripPlaceStop {
+  if (selected.category === 'hotel' || suggestion.category === 'hotel') {
+    invalidRequest();
+  }
   return {
     place: clonePlace(selected),
     category: suggestion.category,
@@ -854,6 +860,9 @@ export class AmapTripPlaceResolver implements TripPlaceResolver {
         if (blockedByProvider) {
           continue;
         }
+        if (selected !== 'NO_MATCH' && selected !== 'DUPLICATE_MATCH' && selected.category === 'hotel') {
+          selected = 'NO_MATCH';
+        }
         if (selected === 'NO_MATCH' || selected === 'DUPLICATE_MATCH') {
           unmatchedByDay[item.dayIndex].push(item.suggestion);
           unresolved.push({
@@ -924,6 +933,9 @@ export class AmapTripPlaceResolver implements TripPlaceResolver {
           },
         );
         for (const next of nextPlaces) {
+          if (next.category === 'hotel') {
+            continue;
+          }
           picked.push({ place: next, query });
         }
       }
@@ -932,6 +944,9 @@ export class AmapTripPlaceResolver implements TripPlaceResolver {
       }
       const schedule = fallbackStopSchedule(days[dayIndex].stops, picked.length);
       picked.forEach((item, index) => {
+        if (item.place.category === 'hotel') {
+          return;
+        }
         usedPlaceIds.add(item.place.id);
         const slot = schedule[index] ?? schedule[schedule.length - 1];
         days[dayIndex].stops.push({

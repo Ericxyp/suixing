@@ -10,6 +10,7 @@ import {
   applyGenerationFailure,
   applyGenerationStarted,
   applySummaryDraftUpdate,
+  applyTripStyleDraftUpdate,
   createEmptyPlanConversation,
   extractPlanRequirements,
   isPlanReadyToGenerate,
@@ -31,6 +32,15 @@ import {
   type PlanGenerationGate,
 } from '../services/plan-generation';
 import { tripRequirementDraftStore } from '../services/trip-requirement-draft-store';
+import { userTravelProfileRepository } from '../repositories/local-storage-user-travel-profile-repository';
+import { explicitProfileSignals } from '../domain/trip/profile';
+import {
+  PLAN_HERO_EYEBROW,
+  planHeaderStatus,
+  planHeroSubtitle,
+  planHeroTitle,
+  planSummaryPeek,
+} from '../services/plan-conversation-display';
 import {
   createRequirementExtractionService,
   getTripAiMode,
@@ -65,12 +75,12 @@ export function PlanConversationPage() {
   const [composer, setComposer] = useState('');
   const [extracting, setExtracting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [summaryOpen, setSummaryOpen] = useState(false);
   const [hydrated, setHydrated] = useState(false);
   const [gate, setGate] = useState<PlanGenerationGate>(createInitialPlanGenerationGate);
   const started = useRef(false);
   const sessionRef = useRef(session);
   const gateRef = useRef(gate);
+  const skipNextAutoCreate = useRef(false);
 
   function persist(next: PlanConversationState) {
     sessionRef.current = next;
@@ -128,6 +138,15 @@ export function PlanConversationPage() {
     }
     if (result.ok) {
       setError(null);
+      const patch = current.draft.profilePatch;
+      const explicit = patch ? explicitProfileSignals(patch.signals) : {};
+      if (Object.keys(explicit).length > 0) {
+        try {
+          await userTravelProfileRepository.saveExplicitPatch({ signals: explicit });
+        } catch {
+          // 长期画像保存失败不得阻断行程创建。
+        }
+      }
       tripRequirementDraftStore.clear();
       planConversationStore.clear();
       navigate(`/trips/${result.tripId}`, { state: { createdFromPlan: true } });
@@ -150,33 +169,41 @@ export function PlanConversationPage() {
       return;
     }
     started.current = true;
-    const initialText = (location.state as PlanLocationState | null)?.initialText?.trim();
-    const stored = planConversationStore.load();
-    if (initialText) {
-      navigate('.', { replace: true, state: {} });
-      if (stored?.messages[0]?.role === 'user' && stored.messages[0].content === initialText) {
-        persist(stored);
-        updateGate(restorePlanGenerationGate(stored.draft));
-        const hasAssistant = stored.messages.some((message) => message.role === 'assistant');
-        if (!hasAssistant) {
-          void runExtraction(stored);
+    void (async () => {
+      const profile = await userTravelProfileRepository.load();
+      const withProfile = (draft: TripRequirementDraft): TripRequirementDraft => (
+        Object.keys(profile.signals).length > 0
+          ? { ...draft, longTermProfileSignals: profile.signals }
+          : draft
+      );
+      const initialText = (location.state as PlanLocationState | null)?.initialText?.trim();
+      const stored = planConversationStore.load();
+      if (initialText) {
+        navigate('.', { replace: true, state: {} });
+        if (stored?.messages[0]?.role === 'user' && stored.messages[0].content === initialText) {
+          persist({ ...stored, draft: withProfile(stored.draft) });
+          updateGate(restorePlanGenerationGate(withProfile(stored.draft)));
+          const hasAssistant = stored.messages.some((message) => message.role === 'assistant');
+          if (!hasAssistant) {
+            void runExtraction({ ...stored, draft: withProfile(stored.draft) });
+          }
+          setHydrated(true);
+          return;
         }
+        clearPlanCreateLocks();
+        const next = appendUserMessage(createEmptyPlanConversation(), initialText);
+        persist({ ...next, draft: withProfile(next.draft) });
+        updateGate(createInitialPlanGenerationGate());
+        void runExtraction({ ...next, draft: withProfile(next.draft) });
         setHydrated(true);
         return;
       }
-      clearPlanCreateLocks();
-      const next = appendUserMessage(createEmptyPlanConversation(), initialText);
-      persist(next);
-      updateGate(createInitialPlanGenerationGate());
-      void runExtraction(next);
+      if (stored) {
+        persist({ ...stored, draft: withProfile(stored.draft) });
+        updateGate(restorePlanGenerationGate(withProfile(stored.draft)));
+      }
       setHydrated(true);
-      return;
-    }
-    if (stored) {
-      persist(stored);
-      updateGate(restorePlanGenerationGate(stored.draft));
-    }
-    setHydrated(true);
+    })();
   }, [location.state, navigate]);
 
   const fingerprint = creationFingerprint(session.draft);
@@ -186,6 +213,10 @@ export function PlanConversationPage() {
       return;
     }
     const nextGate = gateAfterDraftChange(gateRef.current, session.draft);
+    if (skipNextAutoCreate.current) {
+      nextGate.skipAutoStart = true;
+      skipNextAutoCreate.current = false;
+    }
     updateGate(nextGate);
     if (!fingerprint) {
       setError(null);
@@ -214,6 +245,14 @@ export function PlanConversationPage() {
     persist(applySummaryDraftUpdate(session, draft, intentMessage));
   }
 
+  function commitStyle(draft: TripRequirementDraft) {
+    if (gate.status === 'generating') {
+      return;
+    }
+    skipNextAutoCreate.current = true;
+    persist(applyTripStyleDraftUpdate(session, draft));
+  }
+
   function leavePlan() {
     planConversationStore.clear();
     clearPlanCreateLocks();
@@ -222,46 +261,51 @@ export function PlanConversationPage() {
   const ready = isPlanReadyToGenerate(session.draft);
   const generating = gate.status === 'generating';
   const showRetry = shouldShowPlanCreateRetry(gate);
+  const headerStatus = planHeaderStatus({
+    extracting,
+    generationStatus: gate.status,
+    ready,
+  });
+  const heroSubtitle = planHeroSubtitle(session.draft);
 
   return (
     <div className="plan-shell">
       <header className="plan-header">
         <Link className="brand" to="/" onClick={leavePlan}>随行</Link>
-        <Link className="plan-header__back" to="/" onClick={leavePlan}>返回首页</Link>
+        {headerStatus && <p className="plan-header__status">{headerStatus}</p>}
       </header>
-      <div className="plan-layout">
-        <details
-          className="travel-summary-fold"
-          open={summaryOpen}
-          onToggle={(event) => setSummaryOpen(event.currentTarget.open)}
-        >
-          <summary>本次旅行{ready ? ' · 信息已齐全' : ''}</summary>
-          <TravelSummary
-            draft={session.draft}
-            complete={ready}
-            locked={generating}
-            onDraftCommit={commitSummary}
+      <div className="plan-main">
+        <section className="plan-hero" aria-labelledby="plan-hero-title">
+          <p className="plan-hero__eyebrow">{PLAN_HERO_EYEBROW}</p>
+          <h1 id="plan-hero-title">{planHeroTitle(session.draft)}</h1>
+          {heroSubtitle && <p className="plan-hero__lede">{heroSubtitle}</p>}
+        </section>
+        <div className="plan-layout">
+          <PlanConversation
+            state={session}
+            composerValue={composer}
+            onComposerChange={setComposer}
+            onSubmit={() => void submitComposer()}
+            extracting={extracting}
+            generating={generating}
+            generationStatus={gate.status}
+            error={error}
+            showRetry={showRetry}
+            onRetry={() => void createFromCurrentDraft('retry')}
+            onTripStyleSave={commitStyle}
           />
-        </details>
-        <PlanConversation
-          state={session}
-          composerValue={composer}
-          onComposerChange={setComposer}
-          onSubmit={() => void submitComposer()}
-          extracting={extracting}
-          generating={generating}
-          generationStatus={gate.status}
-          error={error}
-          showRetry={showRetry}
-          onRetry={() => void createFromCurrentDraft('retry')}
-        />
-        <div className="travel-summary-desktop">
-          <TravelSummary
-            draft={session.draft}
-            complete={ready}
-            locked={generating}
-            onDraftCommit={commitSummary}
-          />
+          <details className="plan-summary-rail">
+            <summary>
+              <span>旅行信息{ready ? ' · 信息已齐全' : ''}</span>
+              <small>{planSummaryPeek(session.draft)}</small>
+            </summary>
+            <TravelSummary
+              draft={session.draft}
+              complete={ready}
+              locked={generating}
+              onDraftCommit={commitSummary}
+            />
+          </details>
         </div>
       </div>
     </div>

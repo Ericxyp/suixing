@@ -15,12 +15,15 @@ import {
   TRIP_CHANGE_SEARCH_LIMIT,
   TripChangeExecutionError,
 } from '../server/services/trip-change-executor';
+import { validateDayItineraryCompleteness } from '../server/services/trip-itinerary-completeness-validator';
+import { parseClockMinutes } from '../server/services/trip-day-density-planner';
 import type { PlaceSearchService } from '../server/services/trip-place-resolver';
 import {
   AmapTripRouteEnricher,
   type RoutePlanningService,
 } from '../server/services/trip-route-enricher';
 import type { GeoPoint, Place, Trip, TripPlace, TripRoute } from '../src/domain/trip/types';
+import type { TripPlanningContextV1 } from '../src/domain/trip/profile';
 
 function geo(latitude: number, longitude: number): GeoPoint {
   return { latitude, longitude };
@@ -173,8 +176,12 @@ function replaceWallOp() {
 
 class FakePlaceSearch implements PlaceSearchService {
   calls: PlaceSearchInput[] = [];
+  detailCalls: string[] = [];
 
-  constructor(private readonly handler: (input: PlaceSearchInput) => Promise<Place[]>) {}
+  constructor(
+    private readonly handler: (input: PlaceSearchInput) => Promise<Place[]>,
+    private readonly detailHandler?: (providerPlaceId: string) => Promise<Place | null>,
+  ) {}
 
   async search(input: PlaceSearchInput): Promise<Place[]> {
     this.calls.push({
@@ -203,6 +210,14 @@ class FakePlaceSearch implements PlaceSearchService {
       return [...found, extra];
     }
     return found;
+  }
+
+  async getByProviderPlaceId(providerPlaceId: string): Promise<Place | null> {
+    this.detailCalls.push(providerPlaceId);
+    if (this.detailHandler) {
+      return this.detailHandler(providerPlaceId);
+    }
+    return null;
   }
 }
 
@@ -479,9 +494,480 @@ test('rebuilds scheduleItems only for the replaced day', async () => {
   assert.equal(JSON.stringify(result.summary).includes('GAP_FILL'), false);
 });
 
-test('selecting a meal place replaces a flexible slot and recalculates the day', async () => {
+test('selecting lunch keeps an existing dinner meal_place and stays complete', async () => {
+  const temple = place({ id: 'amap:TEMPLE-LUNCH', name: '天坛公园', latitude: 39.882, longitude: 116.407 });
+  const gate = place({ id: 'amap:GATE-LUNCH', name: '天安门', latitude: 39.907, longitude: 116.391 });
+  const street = place({ id: 'amap:QIANMEN', name: '前门大街', latitude: 39.899, longitude: 116.398 });
+  const trip = sampleTrip();
+  const dinnerStop = tripPlace('day-1', 4, dinnerSpot, {
+    startTime: '18:30',
+    durationMinutes: 75,
+    id: 'day-1:meal:dinner',
+    type: 'restaurant',
+    description: '晚餐安排。',
+  });
+  trip.days[0].places = [
+    tripPlace('day-1', 1, gate, { startTime: '10:00', durationMinutes: 120 }),
+    tripPlace('day-1', 2, temple, { startTime: '14:25', durationMinutes: 120 }),
+    tripPlace('day-1', 3, street, { startTime: '16:50', durationMinutes: 90 }),
+    dinnerStop,
+  ];
+  trip.days[0].places[0].transportToNext = {
+    mode: 'taxi',
+    durationMinutes: 36,
+    distanceMeters: 5600,
+  };
+  trip.days[0].places[1].transportToNext = {
+    mode: 'taxi',
+    durationMinutes: 20,
+    distanceMeters: 3200,
+  };
+  trip.days[0].places[2].transportToNext = {
+    mode: 'walk',
+    durationMinutes: 12,
+    distanceMeters: 800,
+  };
+  trip.days[0].scheduleItems = [
+    { kind: 'place', tripPlaceId: 'day-1:stop:1', startTime: '10:00', durationMinutes: 120 },
+    {
+      kind: 'meal_slot',
+      id: 'day-1:meal:lunch',
+      mealPeriod: 'lunch',
+      startTime: '12:15',
+      durationMinutes: 75,
+      areaTripPlaceId: 'day-1:stop:1',
+      nextTripPlaceId: 'day-1:stop:2',
+      diningMode: 'flexible',
+    },
+    { kind: 'place', tripPlaceId: 'day-1:stop:2', startTime: '14:25', durationMinutes: 120 },
+    { kind: 'place', tripPlaceId: 'day-1:stop:3', startTime: '16:50', durationMinutes: 90 },
+    {
+      kind: 'meal_place',
+      tripPlaceId: 'day-1:meal:dinner',
+      mealPeriod: 'dinner',
+      startTime: '18:30',
+      durationMinutes: 75,
+    },
+  ];
+  const before = validateDayItineraryCompleteness({
+    pace: 'balanced',
+    placeIds: new Set(trip.days[0].places.map((item) => item.id)),
+    corePlaceCount: 3,
+    items: trip.days[0].scheduleItems,
+    places: trip.days[0].places,
+  });
+  assert.equal(before.valid, true, before.reason);
+  const snapshot = structuredClone(trip);
+  const search: PlaceSearchService = {
+    async search() {
+      return [structuredClone(lunchSpot)];
+    },
+  };
+  const service = new AmapTripChangeExecutor(search, new AmapTripRouteEnricher(new FakeRouteService()));
+  let result;
+  try {
+    result = await service.selectMealPlace({
+      trip,
+      places: catalog([lunchSpot, dinnerSpot, temple, gate, street]),
+      operation: {
+        type: 'SELECT_MEAL_PLACE',
+        dayNumber: 1,
+        mealSlotId: 'day-1:meal:lunch',
+        placeId: lunchSpot.id,
+      },
+      updatedAt: '2026-09-16T12:00:00.000Z',
+    });
+  } catch (error) {
+    assert.ok(error instanceof TripChangeExecutionError);
+    assert.fail(`lunch apply failed ${error.code} ${error.validationReason ?? 'no-reason'}`);
+  }
+  const items = result.trip.days[0].scheduleItems ?? [];
+  const lunchItems = items.filter((item) => (
+    (item.kind === 'meal_place' || item.kind === 'meal_slot') && item.mealPeriod === 'lunch'
+  ));
+  const dinnerItems = items.filter((item) => (
+    (item.kind === 'meal_place' || item.kind === 'meal_slot') && item.mealPeriod === 'dinner'
+  ));
+  assert.equal(lunchItems.length, 1);
+  assert.equal(lunchItems[0]?.kind, 'meal_place');
+  assert.equal(dinnerItems.length, 1);
+  assert.equal(dinnerItems[0]?.kind, 'meal_place');
+  assert.equal(result.trip.days[0].places.filter((item) => item.type === 'attraction').length, 3);
+  assert.equal(result.trip.days[0].places.some((item) => item.placeId === lunchSpot.id), true);
+  assert.equal(result.trip.days[0].places.some((item) => item.placeId === dinnerSpot.id), true);
+  const lunchItem = items.find((item) => item.kind === 'meal_place' && item.mealPeriod === 'lunch');
+  const nextCore = items.find((item) => item.kind === 'place' && item.tripPlaceId === 'day-1:stop:2');
+  assert.ok(lunchItem && nextCore);
+  const lunchEnd = (parseClockMinutes(lunchItem.startTime) ?? 0) + lunchItem.durationMinutes;
+  assert.ok((parseClockMinutes(nextCore.startTime) ?? 0) >= lunchEnd);
+  assert.deepEqual(trip, snapshot);
+});
+
+test('selecting lunch uses the same nearby dining search as the options sheet', async () => {
+  const temple = place({ id: 'amap:TEMPLE-NEAR', name: '天坛公园', latitude: 39.882, longitude: 116.407 });
+  const gate = place({ id: 'amap:GATE-NEAR', name: '天安门', latitude: 39.907, longitude: 116.391 });
+  const street = place({ id: 'amap:QIANMEN-NEAR', name: '前门大街', latitude: 39.899, longitude: 116.398 });
+  const sheetRestaurant = place({
+    id: 'amap:SHEET-LUNCH',
+    name: '陈记卤煮小肠',
+    category: 'restaurant',
+    latitude: 39.91,
+    longitude: 116.4,
+  });
+  const otherRestaurant = place({
+    id: 'amap:OTHER-LUNCH',
+    name: '另一家餐厅',
+    category: 'restaurant',
+    latitude: 39.91,
+    longitude: 116.4,
+  });
+  const trip = sampleTrip();
+  const dinnerStop = tripPlace('day-1', 4, dinnerSpot, {
+    startTime: '18:30',
+    durationMinutes: 75,
+    id: 'day-1:meal:dinner',
+    type: 'restaurant',
+    description: '晚餐安排。',
+  });
+  trip.days[0].places = [
+    tripPlace('day-1', 1, gate, { startTime: '10:00', durationMinutes: 120 }),
+    tripPlace('day-1', 2, temple, { startTime: '14:25', durationMinutes: 120 }),
+    tripPlace('day-1', 3, street, { startTime: '16:50', durationMinutes: 90 }),
+    dinnerStop,
+  ];
+  trip.days[0].scheduleItems = [
+    { kind: 'place', tripPlaceId: 'day-1:stop:1', startTime: '10:00', durationMinutes: 120 },
+    {
+      kind: 'meal_slot',
+      id: 'day-1:meal:lunch',
+      mealPeriod: 'lunch',
+      startTime: '12:15',
+      durationMinutes: 75,
+      areaTripPlaceId: 'day-1:stop:1',
+      nextTripPlaceId: 'day-1:stop:2',
+      diningMode: 'flexible',
+    },
+    { kind: 'place', tripPlaceId: 'day-1:stop:2', startTime: '14:25', durationMinutes: 120 },
+    { kind: 'place', tripPlaceId: 'day-1:stop:3', startTime: '16:50', durationMinutes: 90 },
+    {
+      kind: 'meal_place',
+      tripPlaceId: 'day-1:meal:dinner',
+      mealPeriod: 'dinner',
+      startTime: '18:30',
+      durationMinutes: 75,
+    },
+  ];
+  const search: PlaceSearchService = {
+    async search(input) {
+      if (input.query.includes('附近')) {
+        return [structuredClone(sheetRestaurant)];
+      }
+      return [structuredClone(otherRestaurant)];
+    },
+  };
+  const service = new AmapTripChangeExecutor(search, new AmapTripRouteEnricher(new FakeRouteService()));
+  let result;
+  try {
+    result = await service.selectMealPlace({
+      trip,
+      places: catalog([sheetRestaurant, otherRestaurant, dinnerSpot, temple, gate, street]),
+      operation: {
+        type: 'SELECT_MEAL_PLACE',
+        dayNumber: 1,
+        mealSlotId: 'day-1:meal:lunch',
+        placeId: sheetRestaurant.id,
+      },
+      updatedAt: '2026-09-16T12:00:00.000Z',
+    });
+  } catch (error) {
+    assert.ok(error instanceof TripChangeExecutionError);
+    assert.fail(`lunch apply failed ${error.code} ${error.validationReason ?? 'no-reason'}`);
+  }
+  assert.equal(result.trip.days[0].places.some((item) => item.placeId === sheetRestaurant.id), true);
+  assert.equal(result.trip.days[0].scheduleItems?.some((item) => (
+    item.kind === 'meal_place' && item.mealPeriod === 'lunch'
+  )), true);
+  assert.equal(result.trip.days[0].scheduleItems?.some((item) => (
+    item.kind === 'meal_place' && item.mealPeriod === 'dinner'
+  )), true);
+});
+
+test('selecting a meal place on a three-core 2-hour day stays complete without extra cores', async () => {
+  const temple = place({ id: 'amap:TEMPLE3', name: '天坛公园', latitude: 39.882, longitude: 116.407 });
+  const gate = place({ id: 'amap:GATE', name: '天安门', latitude: 39.907, longitude: 116.391 });
+  const palaceStop = place({ id: 'amap:PALACE2', name: '故宫', latitude: 39.916, longitude: 116.397 });
+  const trip = sampleTrip();
+  trip.days[0].places = [
+    tripPlace('day-1', 1, gate, { startTime: '10:00', durationMinutes: 120 }),
+    tripPlace('day-1', 2, palaceStop, { startTime: '14:25', durationMinutes: 120 }),
+    tripPlace('day-1', 3, temple, { startTime: '17:00', durationMinutes: 90 }),
+  ];
+  trip.days[0].places[0].transportToNext = {
+    mode: 'taxi',
+    durationMinutes: 36,
+    distanceMeters: 5600,
+  };
+  trip.days[0].places[1].transportToNext = {
+    mode: 'taxi',
+    durationMinutes: 26,
+    distanceMeters: 4800,
+  };
+  trip.days[0].scheduleItems = [
+    { kind: 'place', tripPlaceId: 'day-1:stop:1', startTime: '10:00', durationMinutes: 120 },
+    {
+      kind: 'meal_slot',
+      id: 'day-1:meal:lunch',
+      mealPeriod: 'lunch',
+      startTime: '12:15',
+      durationMinutes: 75,
+      areaTripPlaceId: 'day-1:stop:1',
+      nextTripPlaceId: 'day-1:stop:2',
+      diningMode: 'flexible',
+    },
+    { kind: 'place', tripPlaceId: 'day-1:stop:2', startTime: '14:25', durationMinutes: 120 },
+    { kind: 'place', tripPlaceId: 'day-1:stop:3', startTime: '17:00', durationMinutes: 90 },
+  ];
+  const before = validateDayItineraryCompleteness({
+    pace: 'balanced',
+    placeIds: new Set(trip.days[0].places.map((item) => item.id)),
+    corePlaceCount: 3,
+    items: trip.days[0].scheduleItems,
+    places: trip.days[0].places,
+  });
+  assert.equal(before.valid, true, before.reason);
+  const search: PlaceSearchService = {
+    async search() {
+      return [structuredClone(lunchSpot)];
+    },
+  };
+  const service = new AmapTripChangeExecutor(search, new AmapTripRouteEnricher(new FakeRouteService()));
+  try {
+    const result = await service.selectMealPlace({
+      trip,
+      places: catalog([lunchSpot, temple, gate, palaceStop]),
+      operation: {
+        type: 'SELECT_MEAL_PLACE',
+        dayNumber: 1,
+        mealSlotId: 'day-1:meal:lunch',
+        placeId: lunchSpot.id,
+      },
+      updatedAt: '2026-09-16T12:00:00.000Z',
+    });
+    assert.equal(result.trip.days[0].places.filter((item) => item.type === 'attraction').length, 3);
+    assert.equal(result.trip.days[0].scheduleItems?.filter((item) => item.kind === 'meal_place').length, 1);
+    assert.equal(result.trip.days[0].scheduleItems?.some((item) => item.kind === 'meal_slot' && item.mealPeriod === 'lunch'), false);
+  } catch (error) {
+    assert.ok(error instanceof TripChangeExecutionError);
+    assert.fail(`meal apply failed ${error.code} ${error.validationReason ?? 'no-reason'}`);
+  }
+});
+
+test('selecting a meal place keeps a valid two-core day without inventing a third attraction', async () => {
+  const trip = sampleTrip();
+  trip.days[0].places[0].durationMinutes = 120;
+  trip.days[0].places[1].startTime = '14:25';
+  trip.days[0].places[1].durationMinutes = 120;
+  trip.days[0].scheduleItems = [
+    {
+      kind: 'place',
+      tripPlaceId: 'day-1:stop:1',
+      startTime: '10:00',
+      durationMinutes: 120,
+    },
+    {
+      kind: 'meal_slot',
+      id: 'day-1:meal:lunch',
+      mealPeriod: 'lunch',
+      startTime: '12:15',
+      durationMinutes: 75,
+      areaTripPlaceId: 'day-1:stop:1',
+      nextTripPlaceId: 'day-1:stop:2',
+      diningMode: 'flexible',
+    },
+    {
+      kind: 'place',
+      tripPlaceId: 'day-1:stop:2',
+      startTime: '14:25',
+      durationMinutes: 120,
+    },
+    {
+      kind: 'hotel_return',
+      id: 'day-1:return:1',
+      startTime: '16:40',
+      durationMinutes: 45,
+      title: '返程准备',
+      description: '结束当天行程，预留返回住处的时间。',
+    },
+  ];
+  const search: PlaceSearchService = {
+    async search() {
+      return [structuredClone(lunchSpot)];
+    },
+  };
+  const service = new AmapTripChangeExecutor(search, new AmapTripRouteEnricher(new FakeRouteService()));
+  await assert.rejects(
+    () => service.selectMealPlace({
+      trip,
+      places: catalog([lunchSpot]),
+      operation: {
+        type: 'SELECT_MEAL_PLACE',
+        dayNumber: 1,
+        mealSlotId: 'day-1:meal:lunch',
+        placeId: lunchSpot.id,
+      },
+      updatedAt: '2026-09-16T12:00:00.000Z',
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof TripChangeExecutionError);
+      assert.equal(error.code, 'TRIP_CHANGE_INCOMPLETE');
+      assert.equal(error.validationReason, 'INVALID_TWO_PLACE_DAY');
+      assert.equal(error.message.includes('INVALID_TWO_PLACE_DAY'), false);
+      assert.equal(error.message, TRIP_CHANGE_INCOMPLETE_MESSAGE);
+      return true;
+    },
+  );
+});
+
+function lowWalkingPlanningContext(): TripPlanningContextV1 {
+  return {
+    tripIntent: { interestKeys: ['history', 'culture_art'] },
+    partyContext: {
+      partyType: 'parents',
+      hasElderly: true,
+      mobilityRequirement: 'low_walking',
+    },
+    constraints: {
+      excludedInterestKeys: [],
+      lowWalking: true,
+    },
+  };
+}
+
+test('low-walking planningContext two-core days stay complete after meal apply', async () => {
+  const trip = sampleTrip();
+  trip.planningContext = lowWalkingPlanningContext();
+  trip.days[0].places[0].durationMinutes = 120;
+  trip.days[0].places[1].startTime = '14:25';
+  trip.days[0].places[1].durationMinutes = 120;
+  trip.days[0].scheduleItems = [
+    { kind: 'place', tripPlaceId: 'day-1:stop:1', startTime: '10:00', durationMinutes: 120 },
+    {
+      kind: 'meal_slot',
+      id: 'day-1:meal:lunch',
+      mealPeriod: 'lunch',
+      startTime: '12:15',
+      durationMinutes: 75,
+      areaTripPlaceId: 'day-1:stop:1',
+      nextTripPlaceId: 'day-1:stop:2',
+      diningMode: 'flexible',
+    },
+    { kind: 'place', tripPlaceId: 'day-1:stop:2', startTime: '14:25', durationMinutes: 120 },
+    {
+      kind: 'hotel_return',
+      id: 'day-1:return:1',
+      startTime: '16:40',
+      durationMinutes: 45,
+      title: '返程准备',
+      description: '结束当天行程，预留返回住处的时间。',
+    },
+  ];
+  const search: PlaceSearchService = {
+    async search() {
+      return [structuredClone(lunchSpot)];
+    },
+  };
+  const service = new AmapTripChangeExecutor(search, new AmapTripRouteEnricher(new FakeRouteService()));
+  const result = await service.selectMealPlace({
+    trip,
+    places: catalog([lunchSpot]),
+    operation: {
+      type: 'SELECT_MEAL_PLACE',
+      dayNumber: 1,
+      mealSlotId: 'day-1:meal:lunch',
+      placeId: lunchSpot.id,
+    },
+    updatedAt: '2026-09-16T12:00:00.000Z',
+  });
+  assert.equal(result.trip.days[0].places.filter((item) => item.type === 'attraction').length, 2);
+  assert.equal(result.trip.planningContext?.partyContext?.partyType, 'parents');
+  assert.equal(result.summary.type, 'SELECT_MEAL_PLACE');
+  const afterMeal = validateDayItineraryCompleteness({
+    pace: result.trip.pace,
+    targetCorePlacesPerDay: 2,
+    placeIds: new Set(result.trip.days[0].places.map((item) => item.id)),
+    corePlaceCount: 2,
+    items: result.trip.days[0].scheduleItems ?? [],
+    places: result.trip.days[0].places,
+  });
+  assert.equal(afterMeal.valid, true, afterMeal.reason);
+});
+
+test('low-walking planningContext two-core days stay complete after replace place', async () => {
+  const trip = sampleTrip();
+  trip.planningContext = lowWalkingPlanningContext();
+  trip.days[0].places[0].durationMinutes = 120;
+  trip.days[0].places[1].startTime = '14:25';
+  trip.days[0].places[1].durationMinutes = 120;
+  trip.days[0].scheduleItems = [
+    { kind: 'place', tripPlaceId: 'day-1:stop:1', startTime: '10:00', durationMinutes: 120 },
+    {
+      kind: 'meal_slot',
+      id: 'day-1:meal:lunch',
+      mealPeriod: 'lunch',
+      startTime: '12:15',
+      durationMinutes: 75,
+      areaTripPlaceId: 'day-1:stop:1',
+      nextTripPlaceId: 'day-1:stop:2',
+      diningMode: 'flexible',
+    },
+    { kind: 'place', tripPlaceId: 'day-1:stop:2', startTime: '14:25', durationMinutes: 120 },
+    {
+      kind: 'hotel_return',
+      id: 'day-1:return:1',
+      startTime: '16:40',
+      durationMinutes: 45,
+      title: '返程准备',
+      description: '结束当天行程，预留返回住处的时间。',
+    },
+  ];
+  const nearby = place({
+    id: 'amap:NEAR',
+    name: '劳动人民文化宫',
+    latitude: 39.913,
+    longitude: 116.403,
+  });
+  const { service } = executor(new FakePlaceSearch(async () => [structuredClone(nearby)]));
+  const result = await service.replacePlace({
+    trip,
+    places: catalog([nearby]),
+    operation: {
+      type: 'REPLACE_PLACE',
+      dayNumber: 1,
+      targetTripPlaceId: 'day-1:stop:2',
+      replacementQuery: '劳动人民文化宫',
+    },
+    updatedAt: '2026-09-16T12:00:00.000Z',
+  });
+  assert.equal(result.trip.days[0].places.filter((item) => (
+    item.type === 'attraction' || item.type === 'activity'
+  )).length, 2);
+  assert.equal(result.summary.type, 'REPLACE_PLACE');
+  const afterReplace = validateDayItineraryCompleteness({
+    pace: result.trip.pace,
+    targetCorePlacesPerDay: 2,
+    placeIds: new Set(result.trip.days[0].places.map((item) => item.id)),
+    corePlaceCount: 2,
+    items: result.trip.days[0].scheduleItems ?? [],
+    places: result.trip.days[0].places,
+  });
+  assert.equal(afterReplace.valid, true, afterReplace.reason);
+});
+
+
+test('selecting a meal place does not fail when search cannot invent another core attraction', async () => {
   const trip = sampleTrip();
   trip.days[0].places[1].startTime = '14:30';
+  trip.days[0].places[1].durationMinutes = 180;
   trip.days[0].scheduleItems = [
     {
       kind: 'place',
@@ -503,7 +989,140 @@ test('selecting a meal place replaces a flexible slot and recalculates the day',
       kind: 'place',
       tripPlaceId: 'day-1:stop:2',
       startTime: '14:30',
+      durationMinutes: 180,
+    },
+    {
+      kind: 'hotel_return',
+      id: 'day-1:return:1',
+      startTime: '17:00',
+      durationMinutes: 30,
+      title: '返程准备',
+      description: '结束当天行程，返回住处。',
+    },
+  ];
+  const search: PlaceSearchService = {
+    async search() {
+      return [structuredClone(lunchSpot)];
+    },
+  };
+  const service = new AmapTripChangeExecutor(search, new AmapTripRouteEnricher(new FakeRouteService()));
+  const result = await service.selectMealPlace({
+    trip,
+    places: catalog([lunchSpot]),
+    operation: {
+      type: 'SELECT_MEAL_PLACE',
+      dayNumber: 1,
+      mealSlotId: 'day-1:meal:lunch',
+      placeId: lunchSpot.id,
+    },
+    updatedAt: '2026-09-16T12:00:00.000Z',
+  });
+  assert.equal(result.trip.days[0].places.filter((item) => item.type === 'attraction').length, 2);
+  assert.equal(result.trip.days[0].scheduleItems?.some((item) => item.kind === 'meal_place'), true);
+  assert.equal(result.trip.days[0].scheduleItems?.some((item) => item.kind === 'meal_slot' && item.mealPeriod === 'lunch'), false);
+});
+
+test('selecting a meal place on a three-core balanced day replaces the slot and stays complete', async () => {
+  const temple = place({ id: 'amap:TEMPLE', name: '天坛公园', latitude: 39.882, longitude: 116.407 });
+  const trip = sampleTrip();
+  trip.days[0].places = [
+    tripPlace('day-1', 1, palace, { startTime: '10:00', durationMinutes: 90 }),
+    tripPlace('day-1', 2, park, { startTime: '14:25', durationMinutes: 90 }),
+    tripPlace('day-1', 3, temple, { startTime: '16:30', durationMinutes: 90 }),
+  ];
+  trip.days[0].places[0].transportToNext = {
+    mode: 'taxi',
+    durationMinutes: 20,
+    distanceMeters: 4000,
+  };
+  trip.days[0].places[1].transportToNext = {
+    mode: 'taxi',
+    durationMinutes: 18,
+    distanceMeters: 3600,
+  };
+  trip.days[0].scheduleItems = [
+    {
+      kind: 'place',
+      tripPlaceId: 'day-1:stop:1',
+      startTime: '10:00',
       durationMinutes: 90,
+    },
+    {
+      kind: 'meal_slot',
+      id: 'day-1:meal:lunch',
+      mealPeriod: 'lunch',
+      startTime: '11:30',
+      durationMinutes: 75,
+      areaTripPlaceId: 'day-1:stop:1',
+      nextTripPlaceId: 'day-1:stop:2',
+      diningMode: 'flexible',
+    },
+    {
+      kind: 'place',
+      tripPlaceId: 'day-1:stop:2',
+      startTime: '14:25',
+      durationMinutes: 90,
+    },
+    {
+      kind: 'place',
+      tripPlaceId: 'day-1:stop:3',
+      startTime: '16:30',
+      durationMinutes: 90,
+    },
+  ];
+  trip.routes = [routeBetween('day-1', trip.days[0].places[0], trip.days[0].places[1], 1)];
+  const snapshot = structuredClone(trip);
+  const { service } = executor(new FakePlaceSearch(async () => [structuredClone(lunchSpot)]));
+  const result = await service.selectMealPlace({
+    trip,
+    places: catalog([lunchSpot, temple]),
+    operation: {
+      type: 'SELECT_MEAL_PLACE',
+      dayNumber: 1,
+      mealSlotId: 'day-1:meal:lunch',
+      placeId: lunchSpot.id,
+    },
+    updatedAt: '2026-09-16T12:00:00.000Z',
+  });
+  const kinds = result.trip.days[0].scheduleItems?.map((item) => item.kind) ?? [];
+  assert.equal(result.summary.type, 'SELECT_MEAL_PLACE');
+  assert.equal(kinds.filter((kind) => kind === 'meal_slot').length, 0);
+  assert.equal(kinds.filter((kind) => kind === 'meal_place').length, 1);
+  assert.equal(result.trip.days[0].scheduleItems?.some((item) => (
+    item.kind === 'meal_place' && item.mealPeriod === 'lunch' && item.tripPlaceId === 'day-1:meal:lunch'
+  )), true);
+  assert.equal(result.trip.days[0].places.filter((item) => item.type === 'attraction' || item.type === 'activity').length, 3);
+  assert.equal(result.trip.days[0].places.some((item) => item.placeId === lunchSpot.id), true);
+  assert.equal(result.places.some((item) => item.id === lunchSpot.id), true);
+  assert.deepEqual(trip, snapshot);
+});
+
+test('selecting a meal place replaces a flexible slot and recalculates the day', async () => {
+  const trip = sampleTrip();
+  trip.days[0].places[1].startTime = '14:30';
+  trip.days[0].places[1].durationMinutes = 180;
+  trip.days[0].scheduleItems = [
+    {
+      kind: 'place',
+      tripPlaceId: 'day-1:stop:1',
+      startTime: '10:00',
+      durationMinutes: 90,
+    },
+    {
+      kind: 'meal_slot',
+      id: 'day-1:meal:lunch',
+      mealPeriod: 'lunch',
+      startTime: '11:30',
+      durationMinutes: 75,
+      areaTripPlaceId: 'day-1:stop:1',
+      nextTripPlaceId: 'day-1:stop:2',
+      diningMode: 'flexible',
+    },
+    {
+      kind: 'place',
+      tripPlaceId: 'day-1:stop:2',
+      startTime: '14:30',
+      durationMinutes: 180,
     },
   ];
   const { service } = executor(new FakePlaceSearch(async () => [structuredClone(lunchSpot)]));
@@ -520,11 +1139,112 @@ test('selecting a meal place replaces a flexible slot and recalculates the day',
   });
   assert.equal(result.summary.type, 'SELECT_MEAL_PLACE');
   assert.equal(result.trip.days[0].places.some((item) => item.placeId === lunchSpot.id), true);
+  assert.equal(result.trip.days[0].places.filter((item) => item.type === 'attraction').length, 2);
   assert.equal(result.trip.days[0].scheduleItems?.some((item) => item.kind === 'meal_slot' && item.mealPeriod === 'lunch'), false);
   assert.equal(result.trip.days[0].scheduleItems?.some((item) => item.kind === 'meal_place' && item.mealPeriod === 'lunch'), true);
   assert.equal(result.places.some((item) => item.id === lunchSpot.id), true);
 });
 
+test('selectMealPlace rejects self_managed slots and non-dining candidates without leaking internals', async () => {
+  const trip = sampleTrip();
+  trip.days[0].scheduleItems = [
+    {
+      kind: 'place',
+      tripPlaceId: 'day-1:stop:1',
+      startTime: '10:00',
+      durationMinutes: 90,
+    },
+    {
+      kind: 'meal_slot',
+      id: 'day-1:meal:lunch',
+      mealPeriod: 'lunch',
+      startTime: '11:30',
+      durationMinutes: 75,
+      areaTripPlaceId: 'day-1:stop:1',
+      nextTripPlaceId: 'day-1:stop:2',
+      diningMode: 'self_managed',
+    },
+    {
+      kind: 'place',
+      tripPlaceId: 'day-1:stop:2',
+      startTime: '14:30',
+      durationMinutes: 180,
+    },
+  ];
+  const snapshot = structuredClone(trip);
+  const { search, routes, service } = executor(new FakePlaceSearch(async () => [structuredClone(lunchSpot)]));
+  await expectInvalid(
+    () => service.selectMealPlace({
+      trip,
+      places: catalog([lunchSpot]),
+      operation: {
+        type: 'SELECT_MEAL_PLACE',
+        dayNumber: 1,
+        mealSlotId: 'day-1:meal:lunch',
+        placeId: lunchSpot.id,
+      },
+      updatedAt: '2026-09-16T12:00:00.000Z',
+    }),
+    search,
+    routes,
+  );
+  assert.deepEqual(trip, snapshot);
+
+  const flexible = sampleTrip();
+  flexible.days[0].places[1].durationMinutes = 180;
+  flexible.days[0].scheduleItems = [
+    {
+      kind: 'place',
+      tripPlaceId: 'day-1:stop:1',
+      startTime: '10:00',
+      durationMinutes: 90,
+    },
+    {
+      kind: 'meal_slot',
+      id: 'day-1:meal:lunch',
+      mealPeriod: 'lunch',
+      startTime: '11:30',
+      durationMinutes: 75,
+      areaTripPlaceId: 'day-1:stop:1',
+      nextTripPlaceId: 'day-1:stop:2',
+      diningMode: 'flexible',
+    },
+    {
+      kind: 'place',
+      tripPlaceId: 'day-1:stop:2',
+      startTime: '14:30',
+      durationMinutes: 180,
+    },
+  ];
+  const attractionOnly: PlaceSearchService = {
+    async search() {
+      return [structuredClone(palace)];
+    },
+  };
+  const diningService = new AmapTripChangeExecutor(
+    attractionOnly,
+    new AmapTripRouteEnricher(new FakeRouteService()),
+  );
+  await assert.rejects(
+    () => diningService.selectMealPlace({
+      trip: flexible,
+      places: catalog(),
+      operation: {
+        type: 'SELECT_MEAL_PLACE',
+        dayNumber: 1,
+        mealSlotId: 'day-1:meal:lunch',
+        placeId: palace.id,
+      },
+      updatedAt: '2026-09-16T12:00:00.000Z',
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof TripChangeExecutionError);
+      assert.equal(error.code, 'TRIP_CHANGE_INCOMPLETE');
+      assert.equal(error.message.includes('MISSING'), false);
+      return true;
+    },
+  );
+});
 
 test('replacePlace rejects a bus stop for a sight query and keeps generation alignment', async () => {
   const bus = place({ id: 'amap:BUS', name: '大明寺(公交站)', category: 'transport' });
@@ -854,4 +1574,156 @@ test('returns unique cloned places actually referenced by the new trip in first-
   assert.equal(summer.name, '颐和园');
   assert.equal(inputPlaces.find((item) => item.id === 'amap:UNUSED')?.name, '圆明园');
   assert.notEqual(result.places[0], inputPlaces[0]);
+});
+
+test('selectMealPlace resolves sheet candidate by stable place id without catalog or re-search', async () => {
+  const temple = place({ id: 'amap:TEMPLE-ID', name: '天坛公园', latitude: 39.882, longitude: 116.407 });
+  const gate = place({ id: 'amap:GATE-ID', name: '天安门', latitude: 39.907, longitude: 116.391 });
+  const street = place({ id: 'amap:STREET-ID', name: '前门大街', latitude: 39.899, longitude: 116.398 });
+  const sheetRestaurant = place({
+    id: 'amap:SHEET-BY-ID',
+    name: '灵隐寺附近面馆',
+    category: 'restaurant',
+    latitude: 39.91,
+    longitude: 116.4,
+  });
+  const trip = sampleTrip();
+  trip.days[0].places = [
+    tripPlace('day-1', 1, gate, { startTime: '10:00', durationMinutes: 120 }),
+    tripPlace('day-1', 2, temple, { startTime: '14:25', durationMinutes: 120 }),
+    tripPlace('day-1', 3, street, { startTime: '16:50', durationMinutes: 90 }),
+  ];
+  trip.days[0].scheduleItems = [
+    { kind: 'place', tripPlaceId: 'day-1:stop:1', startTime: '10:00', durationMinutes: 120 },
+    {
+      kind: 'meal_slot',
+      id: 'day-1:meal:lunch',
+      mealPeriod: 'lunch',
+      startTime: '12:15',
+      durationMinutes: 75,
+      areaTripPlaceId: 'day-1:stop:1',
+      nextTripPlaceId: 'day-1:stop:2',
+      diningMode: 'flexible',
+    },
+    { kind: 'place', tripPlaceId: 'day-1:stop:2', startTime: '14:25', durationMinutes: 120 },
+    { kind: 'place', tripPlaceId: 'day-1:stop:3', startTime: '16:50', durationMinutes: 90 },
+  ];
+  const snapshot = structuredClone(trip);
+  const coreBefore = trip.days[0].places.filter((item) => item.type === 'attraction').length;
+  const search = new FakePlaceSearch(
+    async () => {
+      assert.fail('meal apply must not re-search when stable id resolves');
+      return [];
+    },
+    async (providerPlaceId) => {
+      assert.equal(providerPlaceId, 'SHEET-BY-ID');
+      return structuredClone(sheetRestaurant);
+    },
+  );
+  const routes = new FakeRouteService();
+  const service = new AmapTripChangeExecutor(search, new AmapTripRouteEnricher(routes));
+  const result = await service.selectMealPlace({
+    trip,
+    places: [gate, temple, street, wall, stadium].map((item) => structuredClone(item)),
+    operation: {
+      type: 'SELECT_MEAL_PLACE',
+      dayNumber: 1,
+      mealSlotId: 'day-1:meal:lunch',
+      placeId: sheetRestaurant.id,
+    },
+    updatedAt: '2026-09-16T12:00:00.000Z',
+  });
+  assert.deepEqual(trip, snapshot);
+  assert.equal(search.calls.length, 0);
+  assert.equal(search.detailCalls.length, 1);
+  assert.ok(routes.calls.length >= 1);
+  assert.equal(result.trip.days[0].places.some((item) => item.placeId === sheetRestaurant.id), true);
+  assert.equal(
+    result.trip.days[0].places.filter((item) => item.type === 'attraction').length,
+    coreBefore,
+  );
+  assert.equal(result.trip.days[0].scheduleItems?.some((item) => (
+    item.kind === 'meal_place' && item.mealPeriod === 'lunch'
+  )), true);
+  assert.equal(result.trip.days[0].scheduleItems?.some((item) => (
+    item.kind === 'meal_slot' && item.id === 'day-1:meal:lunch'
+  )), false);
+  assert.equal(result.summary.routeRecalculated, true);
+});
+
+test('replacePlace resolves candidate confirmation by stable place id without name re-search', async () => {
+  const museum = place({
+    id: 'amap:ZHEJIANG-MUSEUM',
+    name: '浙江省博物馆(孤山馆区)',
+    latitude: 30.253,
+    longitude: 120.139,
+  });
+  const search = new FakePlaceSearch(
+    async (input) => {
+      assert.notEqual(input.query, museum.name);
+      assert.notEqual(input.query, museum.id);
+      return [structuredClone(unused)];
+    },
+    async (providerPlaceId) => {
+      assert.equal(providerPlaceId, 'ZHEJIANG-MUSEUM');
+      return structuredClone(museum);
+    },
+  );
+  const routes = new FakeRouteService();
+  const service = new AmapTripChangeExecutor(search, new AmapTripRouteEnricher(routes));
+  const trip = sampleTrip();
+  const snapshot = structuredClone(trip);
+  const result = await service.replacePlace({
+    trip,
+    places: catalog(),
+    operation: {
+      type: 'REPLACE_PLACE',
+      dayNumber: 2,
+      targetTripPlaceId: 'day-2:stop:1',
+      replacementQuery: museum.id,
+    },
+    updatedAt: '2026-09-16T12:00:00.000Z',
+  });
+  assert.deepEqual(trip, snapshot);
+  assert.equal(search.detailCalls.length, 1);
+  assert.equal(search.calls.some((call) => call.query === museum.name || call.query === museum.id), false);
+  assert.ok(routes.calls.length >= 1);
+  assert.equal(result.trip.days[1].places[0].placeId, museum.id);
+  assert.equal(result.trip.days[1].places[0].placeName, museum.name);
+  assert.equal(result.summary.nextPlaceName, museum.name);
+  assert.equal(result.summary.routeRecalculated, true);
+});
+
+test('stable place id miss keeps trip unchanged with NO_MATCH validationReason', async () => {
+  const search = new FakePlaceSearch(
+    async () => [structuredClone(summer)],
+    async () => null,
+  );
+  const routes = new FakeRouteService();
+  const service = new AmapTripChangeExecutor(search, new AmapTripRouteEnricher(routes));
+  const trip = sampleTrip();
+  const snapshot = structuredClone(trip);
+  await assert.rejects(
+    () => service.replacePlace({
+      trip,
+      places: catalog(),
+      operation: {
+        type: 'REPLACE_PLACE',
+        dayNumber: 2,
+        targetTripPlaceId: 'day-2:stop:1',
+        replacementQuery: 'amap:MISSING-POI',
+      },
+      updatedAt: '2026-09-16T12:00:00.000Z',
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof TripChangeExecutionError);
+      assert.equal(error.code, 'TRIP_CHANGE_INCOMPLETE');
+      assert.equal(error.validationReason, 'NO_MATCH');
+      assert.equal(error.message, TRIP_CHANGE_INCOMPLETE_MESSAGE);
+      return true;
+    },
+  );
+  assert.deepEqual(trip, snapshot);
+  assert.equal(search.calls.length, 0);
+  assert.equal(routes.calls.length, 0);
 });

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import test from 'node:test';
+import type { Place } from '../src/domain/trip/types';
 import { createApp } from '../server/app';
 import type { ServerConfig } from '../server/config';
 import {
@@ -78,10 +79,25 @@ async function request(
     body?: string;
     headers?: Record<string, string>;
     extractor?: TripChangeIntentExtractor;
+    places?: Place[];
   } = {},
 ): Promise<{ status: number; body: unknown; text: string; contentType: string }> {
   const server = createServer(
-    createApp(config, { tripChangeIntentExtractor: options.extractor }),
+    createApp(config, {
+      tripChangeIntentExtractor: options.extractor,
+      ...(options.places
+        ? {
+          placeSearchService: {
+            async search() {
+              return options.places ?? [];
+            },
+            async getByProviderPlaceId() {
+              return null;
+            },
+          },
+        }
+        : {}),
+    }),
   );
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -292,4 +308,142 @@ test('maps provider failures and invalid model JSON without leaking internals', 
     error: { code: 'AI_INVALID_RESPONSE', message: AI_INVALID_RESPONSE_MESSAGE },
   });
   assertNoSensitiveLeak(invalid.text);
+});
+
+test('category mall request returns real candidates without applying', async () => {
+  const extractor = new FakeExtractor(async () => ({
+    status: 'needs_clarification' as const,
+    summary: '请提供具体替换成哪个地点名称。',
+    operations: [],
+  }));
+  const shanghai = {
+    tripId: 'trip-sh',
+    destination: '上海',
+    days: [{
+      dayNumber: 1,
+      stops: [
+        { tripPlaceId: 'tp-d1-xintiandi', placeName: '新天地', type: 'shopping', startTime: '18:30' },
+      ],
+    }],
+  };
+  const result = await request({
+    extractor,
+    headers: jsonHeaders(),
+    body: JSON.stringify({
+      input: '不想去新天地，换一个商场',
+      context: shanghai,
+      focus: { selectedDayNumber: 1 },
+    }),
+    places: [{
+      id: 'mall-1',
+      provider: 'mock',
+      providerPlaceId: 'mall-1',
+      name: '兴业太古汇',
+      address: '上海市',
+      latitude: 31.22,
+      longitude: 121.47,
+      category: 'shopping',
+    }],
+  });
+  assert.equal(result.status, 200);
+  const body = result.body as { data: { intent: { status: string; operations: unknown[]; candidates: Array<{ name: string }> } } };
+  assert.equal(body.data.intent.status, 'needs_choice');
+  assert.equal(body.data.intent.operations.length, 0);
+  assert.equal(body.data.intent.candidates[0]?.name, '兴业太古汇');
+  assert.equal(result.text.includes('intentType'), false);
+  assert.equal(result.text.includes('请提供具体替换成哪个地点名称'), false);
+  assertNoSensitiveLeak(result.text);
+});
+
+test('别的商场 still returns candidates when AI JSON is invalid', async () => {
+  const extractor = new FakeExtractor(async () => {
+    throw new AiProviderError('AI_INVALID_RESPONSE', 'RAW_UPSTREAM not json');
+  });
+  const shanghai = {
+    tripId: 'trip-sh',
+    destination: '上海',
+    days: [{
+      dayNumber: 1,
+      stops: [
+        { tripPlaceId: 'tp-d1-xintiandi', placeName: '新天地', type: 'shopping', startTime: '18:30' },
+      ],
+    }],
+  };
+  const result = await request({
+    extractor,
+    headers: jsonHeaders(),
+    body: JSON.stringify({
+      input: '不想去新天地，换个别的商场',
+      context: shanghai,
+      focus: { selectedDayNumber: 1 },
+    }),
+    places: [{
+      id: 'place-xintiandi',
+      provider: 'mock',
+      providerPlaceId: 'place-xintiandi',
+      name: '新天地',
+      address: '上海市',
+      latitude: 31.22,
+      longitude: 121.47,
+      category: 'shopping',
+    }, {
+      id: 'mall-1',
+      provider: 'mock',
+      providerPlaceId: 'mall-1',
+      name: '兴业太古汇',
+      address: '上海市',
+      latitude: 31.22,
+      longitude: 121.47,
+      category: 'shopping',
+    }],
+  });
+  assert.equal(result.status, 200);
+  const body = result.body as { data: { intent: { status: string; operations: unknown[]; candidates: Array<{ name: string }> } } };
+  assert.equal(body.data.intent.status, 'needs_choice');
+  assert.equal(body.data.intent.operations.length, 0);
+  assert.equal(body.data.intent.candidates.some((item) => item.name === '新天地'), false);
+  assert.equal(body.data.intent.candidates[0]?.name, '兴业太古汇');
+  assert.equal(result.text.includes('无法理解'), false);
+  assertNoSensitiveLeak(result.text);
+});
+
+test('empty mall search returns a source-specific empty hint', async () => {
+  const extractor = new FakeExtractor(async () => ({
+    status: 'needs_clarification' as const,
+    summary: '请提供具体替换成哪个地点名称。',
+    operations: [],
+  }));
+  const result = await request({
+    extractor,
+    headers: jsonHeaders(),
+    body: JSON.stringify({
+      input: '不想去新天地，换个别的商场',
+      context: {
+        tripId: 'trip-sh',
+        destination: '上海',
+        days: [{
+          dayNumber: 1,
+          stops: [
+            { tripPlaceId: 'tp-d1-xintiandi', placeName: '新天地', type: 'shopping', startTime: '18:30' },
+          ],
+        }],
+      },
+      focus: { selectedDayNumber: 1 },
+    }),
+    places: [{
+      id: 'place-xintiandi',
+      provider: 'mock',
+      providerPlaceId: 'place-xintiandi',
+      name: '新天地',
+      address: '上海市',
+      latitude: 31.22,
+      longitude: 121.47,
+      category: 'shopping',
+    }],
+  });
+  assert.equal(result.status, 200);
+  const body = result.body as { data: { intent: { status: string; summary: string } } };
+  assert.equal(body.data.intent.status, 'needs_clarification');
+  assert.equal(body.data.intent.summary.includes('新天地附近暂时没有找到合适的商场选择'), true);
+  assert.equal(body.data.intent.summary.includes('无法理解'), false);
 });

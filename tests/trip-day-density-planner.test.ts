@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   isLongStayTripPlace,
+  parseClockMinutes,
   planDaySchedule,
   resolveTripPace,
 } from '../server/services/trip-day-density-planner';
+import { validateDayItineraryCompleteness } from '../server/services/trip-itinerary-completeness-validator';
 import type { TripPlace } from '../src/domain/trip/types';
 
 function stop(overrides: Partial<TripPlace> & Pick<TripPlace, 'id' | 'placeName'>): TripPlace {
@@ -64,6 +66,203 @@ test('balanced two-place days add rest instead of generic experiences', () => {
   assert.equal(result.items.some((item) => item.kind === 'meal_slot'), true);
   assert.equal(result.items.some((item) => item.kind === 'hotel_return'), true);
   assert.equal(/自由活动|自由探索|附近逛逛|随便逛/.test(serialized(result)), false);
+});
+
+test('lunch meal_place between cores plus an existing dinner meal_place stays complete', () => {
+  const result = planDaySchedule({
+    dayId: 'day-1',
+    destination: '北京',
+    pace: 'balanced',
+    dayNumber: 1,
+    places: [
+      stop({
+        id: 'a',
+        placeName: '天安门',
+        startTime: '10:00',
+        durationMinutes: 120,
+        transportToNext: { mode: 'taxi', durationMinutes: 20, distanceMeters: 4000 },
+      }),
+      stop({
+        id: 'lunch',
+        placeName: '午间餐厅',
+        type: 'restaurant',
+        order: 2,
+        startTime: '12:15',
+        durationMinutes: 75,
+        transportToNext: { mode: 'taxi', durationMinutes: 15, distanceMeters: 2500 },
+      }),
+      stop({
+        id: 'b',
+        placeName: '天坛公园',
+        order: 3,
+        startTime: '14:25',
+        durationMinutes: 120,
+        transportToNext: { mode: 'taxi', durationMinutes: 25, distanceMeters: 5000 },
+      }),
+      stop({
+        id: 'c',
+        placeName: '前门大街',
+        order: 4,
+        startTime: '16:50',
+        durationMinutes: 90,
+        transportToNext: { mode: 'walk', durationMinutes: 12, distanceMeters: 800 },
+      }),
+      stop({
+        id: 'dinner',
+        placeName: '南门铜锅涮肉',
+        type: 'restaurant',
+        order: 5,
+        startTime: '18:30',
+        durationMinutes: 75,
+      }),
+    ],
+  });
+  const meals = result.items.filter((item) => item.kind === 'meal_place');
+  assert.equal(meals.length, 2);
+  assert.equal(meals.filter((item) => item.kind === 'meal_place' && item.mealPeriod === 'lunch').length, 1);
+  assert.equal(meals.filter((item) => item.kind === 'meal_place' && item.mealPeriod === 'dinner').length, 1);
+  assert.equal(result.items.some((item) => item.kind === 'meal_slot'), false);
+  const starts = result.items.map((item) => item.startTime);
+  assert.equal(new Set(starts).size, starts.length);
+  for (let index = 1; index < result.items.length; index += 1) {
+    const previous = result.items[index - 1];
+    const current = result.items[index];
+    const previousEnd = (parseClockMinutes(previous.startTime) ?? 0) + previous.durationMinutes;
+    const currentStart = parseClockMinutes(current.startTime) ?? 0;
+    assert.ok(currentStart >= previousEnd, `${previous.startTime} overlaps ${current.startTime}`);
+  }
+});
+
+test('stale start times still keep lunch between cores and dinner last', () => {
+  const result = planDaySchedule({
+    dayId: 'day-1',
+    destination: '北京',
+    pace: 'balanced',
+    dayNumber: 1,
+    places: [
+      stop({
+        id: 'day-1:stop:1',
+        placeName: '天安门',
+        order: 1,
+        startTime: '10:00',
+        durationMinutes: 120,
+        transportToNext: { mode: 'taxi', durationMinutes: 36, distanceMeters: 5600 },
+      }),
+      stop({
+        id: 'day-1:meal:lunch',
+        placeName: '午间餐厅',
+        type: 'restaurant',
+        order: 2,
+        startTime: '12:15',
+        durationMinutes: 75,
+        transportToNext: { mode: 'taxi', durationMinutes: 20, distanceMeters: 3000 },
+      }),
+      stop({
+        id: 'day-1:stop:2',
+        placeName: '天坛公园',
+        order: 3,
+        startTime: '10:00',
+        durationMinutes: 120,
+        transportToNext: { mode: 'taxi', durationMinutes: 25, distanceMeters: 4000 },
+      }),
+      stop({
+        id: 'day-1:stop:3',
+        placeName: '前门大街',
+        order: 4,
+        startTime: '10:00',
+        durationMinutes: 90,
+        transportToNext: { mode: 'walk', durationMinutes: 12, distanceMeters: 800 },
+      }),
+      stop({
+        id: 'day-1:meal:dinner',
+        placeName: '南门铜锅涮肉',
+        type: 'restaurant',
+        order: 5,
+        startTime: '18:30',
+        durationMinutes: 75,
+      }),
+    ],
+  });
+  const kinds = result.items.map((item) => (
+    item.kind === 'meal_place' || item.kind === 'meal_slot'
+      ? `${item.kind}:${item.mealPeriod}`
+      : item.kind
+  ));
+  const completeness = validateDayItineraryCompleteness({
+    pace: 'balanced',
+    placeIds: new Set(result.places.map((place) => place.id)),
+    corePlaceCount: 3,
+    items: result.items,
+    places: result.places,
+  });
+  assert.equal(completeness.valid, true, `${completeness.reason} ${kinds.join('>')}`);
+  assert.equal(kinds.filter((kind) => kind.endsWith(':lunch')).length, 1);
+  assert.equal(kinds.filter((kind) => kind.endsWith(':dinner')).length, 1);
+  assert.equal(result.items.some((item) => item.kind === 'meal_slot'), false);
+});
+
+test('long three-core day with dinner still accepts a midday lunch restaurant', () => {
+  const result = planDaySchedule({
+    dayId: 'day-1',
+    destination: '北京',
+    pace: 'balanced',
+    dayNumber: 1,
+    places: [
+      stop({
+        id: 'a',
+        placeName: '天安门',
+        order: 1,
+        startTime: '10:00',
+        durationMinutes: 180,
+        transportToNext: { mode: 'taxi', durationMinutes: 36, distanceMeters: 5600 },
+      }),
+      stop({
+        id: 'day-1:meal:lunch',
+        placeName: '午间餐厅',
+        type: 'restaurant',
+        order: 2,
+        startTime: '13:15',
+        durationMinutes: 75,
+        transportToNext: { mode: 'taxi', durationMinutes: 20, distanceMeters: 3000 },
+      }),
+      stop({
+        id: 'b',
+        placeName: '故宫',
+        order: 3,
+        startTime: '15:00',
+        durationMinutes: 180,
+        transportToNext: { mode: 'taxi', durationMinutes: 30, distanceMeters: 5000 },
+      }),
+      stop({
+        id: 'c',
+        placeName: '天坛公园',
+        order: 4,
+        startTime: '18:30',
+        durationMinutes: 120,
+        transportToNext: { mode: 'taxi', durationMinutes: 20, distanceMeters: 3500 },
+      }),
+      stop({
+        id: 'day-1:meal:dinner',
+        placeName: '南门铜锅涮肉',
+        type: 'restaurant',
+        order: 5,
+        startTime: '21:00',
+        durationMinutes: 75,
+      }),
+    ],
+  });
+  const completeness = validateDayItineraryCompleteness({
+    pace: 'balanced',
+    placeIds: new Set(result.places.map((place) => place.id)),
+    corePlaceCount: 3,
+    items: result.items,
+    places: result.places,
+  });
+  assert.equal(
+    completeness.valid,
+    true,
+    `${completeness.reason} ${result.items.map((item) => `${item.kind}:${item.startTime}`).join('>')}`,
+  );
 });
 
 test('restaurant stops become meal schedule items', () => {
@@ -273,5 +472,142 @@ test('arranged dining without restaurants does not invent a lunch slot', () => {
   });
   assert.equal(result.items.some((item) => item.kind === 'meal_slot'), false);
   assert.equal(result.items.some((item) => item.kind === 'rest'), false);
+});
+
+function lastEndMinutes(items: { startTime: string; durationMinutes: number }[]): number {
+  return items.reduce((max, item) => (
+    Math.max(max, (parseClockMinutes(item.startTime) ?? 0) + item.durationMinutes)
+  ), 0);
+}
+
+function maxGapMinutes(items: { startTime: string; durationMinutes: number }[]): number {
+  let max = 0;
+  for (let index = 0; index < items.length - 1; index += 1) {
+    const end = (parseClockMinutes(items[index].startTime) ?? 0) + items[index].durationMinutes;
+    const next = parseClockMinutes(items[index + 1].startTime) ?? 0;
+    max = Math.max(max, next - end);
+  }
+  return max;
+}
+
+function shortTwoCores(durationMinutes: number): TripPlace[] {
+  return [
+    stop({
+      id: 'stop-1',
+      placeName: '天坛公园',
+      order: 1,
+      startTime: '10:00',
+      durationMinutes,
+      transportToNext: { mode: 'taxi', durationMinutes: 20, distanceMeters: 4000 },
+    }),
+    stop({
+      id: 'stop-2',
+      placeName: '颐和园',
+      order: 2,
+      startTime: '14:30',
+      durationMinutes,
+    }),
+  ];
+}
+
+test('default balanced two short cores still end too early without policy', () => {
+  const result = planDaySchedule({
+    dayId: 'trip:day:1',
+    destination: '北京',
+    pace: 'balanced',
+    places: shortTwoCores(75),
+  });
+  const completeness = validateDayItineraryCompleteness({
+    pace: 'balanced',
+    placeIds: new Set(result.places.map((place) => place.id)),
+    corePlaceCount: 2,
+    items: result.items,
+    places: result.places,
+  });
+  assert.equal(completeness.valid, false);
+  assert.ok(
+    completeness.reason === 'INVALID_TWO_PLACE_DAY' || completeness.reason === 'DAY_ENDS_TOO_EARLY',
+    completeness.reason,
+  );
+});
+
+test('low-walking policy two cores fill the afternoon without generic placeholders', () => {
+  const result = planDaySchedule({
+    dayId: 'trip:day:1',
+    destination: '北京',
+    pace: 'balanced',
+    planningPolicy: { targetCorePlacesPerDay: 2 },
+    places: shortTwoCores(75),
+  });
+  assert.equal(result.items.some((item) => item.kind === 'meal_slot' && item.mealPeriod === 'lunch'), true);
+  assert.equal(/自由活动|自由探索|附近逛逛|随便逛/.test(serialized(result)), false);
+  assert.equal(result.items.some((item) => item.kind === 'rest' && item.durationMinutes > 45), false);
+  assert.ok(lastEndMinutes(result.items) >= 16 * 60 + 30);
+  assert.ok(maxGapMinutes(result.items) <= 90);
+  const completeness = validateDayItineraryCompleteness({
+    pace: 'balanced',
+    targetCorePlacesPerDay: 2,
+    placeIds: new Set(result.places.map((place) => place.id)),
+    corePlaceCount: 2,
+    items: result.items,
+    places: result.places,
+  });
+  assert.equal(completeness.valid, true, completeness.reason);
+});
+
+test('packed ignores target 2 and still skips hotel return', () => {
+  const result = planDaySchedule({
+    dayId: 'day-1',
+    destination: '北京',
+    pace: 'packed',
+    planningPolicy: { targetCorePlacesPerDay: 2 },
+    places: shortTwoCores(75),
+  });
+  assert.ok(result.reasons.includes('SKIPPED_PACKED'));
+  const completeness = validateDayItineraryCompleteness({
+    pace: 'packed',
+    targetCorePlacesPerDay: 2,
+    placeIds: new Set(result.places.map((place) => place.id)),
+    corePlaceCount: 2,
+    items: result.items,
+    places: result.places,
+  });
+  assert.equal(completeness.valid, false);
+  assert.equal(completeness.reason, 'INSUFFICIENT_CORE_PLACES');
+});
+
+test('two cores with unusable stay length still fail after policy-aware scheduling', () => {
+  const result = planDaySchedule({
+    dayId: 'trip:day:1',
+    destination: '北京',
+    pace: 'balanced',
+    planningPolicy: { targetCorePlacesPerDay: 2 },
+    places: [
+      stop({
+        id: 'stop-1',
+        placeName: '天坛公园',
+        order: 1,
+        startTime: '10:00',
+        durationMinutes: 5,
+      }),
+      stop({
+        id: 'stop-2',
+        placeName: '颐和园',
+        order: 2,
+        startTime: '12:00',
+        durationMinutes: 5,
+      }),
+    ],
+  });
+  const completeness = validateDayItineraryCompleteness({
+    pace: 'balanced',
+    targetCorePlacesPerDay: 2,
+    placeIds: new Set(result.places.map((place) => place.id)),
+    corePlaceCount: 2,
+    items: result.items,
+    places: result.places,
+  });
+  assert.equal(completeness.valid, false);
+  assert.equal(completeness.reason, 'DAY_ENDS_TOO_EARLY');
 });
 

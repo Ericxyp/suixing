@@ -8,6 +8,7 @@ export function PlanComposer({
   value,
   onChange,
   onSubmit,
+  onFocus,
   disabled = false,
   error,
   sending = false,
@@ -16,6 +17,7 @@ export function PlanComposer({
   value: string;
   onChange: (value: string) => void;
   onSubmit: () => void;
+  onFocus?: () => void;
   disabled?: boolean;
   error?: string | null;
   sending?: boolean;
@@ -46,6 +48,7 @@ export function PlanComposer({
         disabled={disabled || sending}
         placeholder={placeholder}
         onChange={(event) => onChange(event.target.value)}
+        onFocus={onFocus}
         onKeyDown={onKeyDown}
       />
       <div className="plan-composer__bar">

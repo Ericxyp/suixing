@@ -169,6 +169,19 @@ test('builds a valid 3-day Trip from a complete requirement and enriched plan', 
   assert.equal('typecode' in result.places[0], false);
 });
 
+test('new generated trips drop hotel stops instead of writing them as itinerary places', () => {
+  const plan = threeDayPlan();
+  const inn = place({ id: 'amap:HOTEL', name: '如家酒店', category: 'hotel' });
+  plan.days[0].stops = [
+    stop(inn, { category: 'hotel', reason: '根据当前城市主题补充的可到访地点。' }),
+    ...plan.days[0].stops,
+  ];
+  const trip = builder.build(input({ plan })).trip;
+  assert.equal(trip.days.some((day) => day.places.some((item) => item.type === 'hotel')), false);
+  assert.equal(trip.days[0].places.some((item) => item.placeName === '如家酒店'), false);
+  assert.equal(trip.days[0].places[0].type, 'attraction');
+});
+
 test('uses injected ids and timestamps without reading the system clock', () => {
   const source = builder.build.toString();
   assert.equal(source.includes('Date.now'), false);

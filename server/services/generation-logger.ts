@@ -46,12 +46,13 @@ export function createConsoleGenerationLogger(): GenerationStageLogger {
         && SAFE_ERROR_CODE.test(entry.validationReason)
         ? entry.validationReason
         : undefined;
-      const payload = entry.stage === 'change_apply'
+      const payload = entry.stage === 'change_apply' || entry.stage === 'meal_apply'
         ? {
           stage: entry.stage,
           outcome: entry.outcome,
           durationMs: entry.durationMs,
           ...(entry.errorCode && SAFE_ERROR_CODE.test(entry.errorCode) ? { errorCode: entry.errorCode } : {}),
+          ...(validationReason ? { validationReason } : {}),
         }
         : entry.stage === 'change_interpret'
         ? {

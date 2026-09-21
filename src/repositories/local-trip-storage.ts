@@ -1,4 +1,5 @@
 import type { Place, Trip, TripExperienceType, TripScheduleItem } from '../domain/trip/types';
+import { parseTripPlanningContextV1 } from '../domain/trip/profile';
 import { referencedPlaceIdsInTripOrder } from './trip-repository';
 
 export const TRIP_REPOSITORY_STORAGE_KEY = 'suixing.trip-repository.v1';
@@ -642,6 +643,7 @@ function readTrip(value: unknown): Trip | undefined {
     'routes',
     'createdAt',
     'updatedAt',
+    'planningContext',
   ]);
   if (Object.keys(value).some((key) => !allowed.has(key))) {
     return undefined;
@@ -731,6 +733,13 @@ function readTrip(value: unknown): Trip | undefined {
     if (value.endDate !== '') {
       trip.endDate = value.endDate;
     }
+  }
+  if (value.planningContext !== undefined) {
+    const planningContext = parseTripPlanningContextV1(value.planningContext);
+    if (!planningContext) {
+      return undefined;
+    }
+    trip.planningContext = planningContext;
   }
   return trip;
 }
@@ -888,6 +897,7 @@ function serializeTrip(trip: Trip): Record<string, unknown> {
     })),
     createdAt: trip.createdAt,
     updatedAt: trip.updatedAt,
+    ...(trip.planningContext ? { planningContext: structuredClone(trip.planningContext) } : {}),
   };
 }
 

@@ -58,6 +58,10 @@ export function creationFingerprint(draft: TripRequirementDraft): string | null 
       mustVisit: sortedList(requirements.preferences?.mustVisit),
       avoid: sortedList(requirements.preferences?.avoid),
     },
+    tripIntent: requirements.tripIntent ?? null,
+    partyContext: requirements.partyContext ?? null,
+    constraints: requirements.constraints ?? null,
+    profileSignals: requirements.profileSignals ?? null,
   });
 }
 

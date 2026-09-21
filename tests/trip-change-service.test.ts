@@ -163,7 +163,7 @@ test('needs_clarification keeps the panel open and does not call apply', async (
   assert.equal(ui.open, true);
   assert.equal(ui.phase, 'needs_clarification');
   assert.equal(canSubmitAssistant(ui), true);
-  assert.equal(ui.draft, '换个地方');
+  assert.equal(ui.draft, '');
   assert.equal(ui.error, null);
   assert.equal(ui.messages.some((item) => item.content === '请问要改哪一天的哪个地点？'), true);
 });
@@ -285,7 +285,8 @@ test('save failure does not keep the applied trip and does not retry apply', asy
   const failed = markFailed(beginApply(beginInterpret(createAssistantUiState(), '换成豫园')), TRIP_CHANGE_SAVE_FAILED_NOTICE);
   assert.equal(failed.open, true);
   assert.equal(failed.phase, 'failed');
-  assert.equal(failed.draft, '换成豫园');
+  assert.equal(failed.draft, '');
+  assert.equal(failed.pendingRestoreText, '换成豫园');
 });
 
 test('maps 422, 502, 503, timeout and invalid responses without mock fallback', () => {
@@ -362,7 +363,7 @@ test('assistant source does not include confirmation, sparkle or server secrets'
     assert.equal(source.includes('json_schema'), false);
     assert.equal(source.includes('dashscope.aliyuncs.com'), false);
   }
-  const workspace = readFileSync(join('src/components/trip/TripWorkspace.tsx'), 'utf8');
+  const workspace = readFileSync(join('src/components/trip/ItineraryTimeline.tsx'), 'utf8');
   assert.equal(workspace.includes('timeline-item--experience'), true);
   assert.equal(workspace.includes('kind === \'experience\''), true);
   assert.equal(TRIP_CHANGE_INTERPRET_PATH.startsWith('/api/'), true);

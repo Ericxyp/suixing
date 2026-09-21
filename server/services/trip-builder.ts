@@ -10,6 +10,7 @@ import type {
   TripPreference,
   TripRoute,
 } from '../../src/domain/trip/types';
+import type { TripPlanningContextV1 } from '../../src/domain/trip/profile';
 import {
   parseConfirmedTripRequirement,
   type ConfirmedTripRequirement,
@@ -20,7 +21,7 @@ import type {
   RouteEnrichedTripPlanSuggestion,
   UnresolvedTripRoute,
 } from './trip-route-enricher';
-import { planDaySchedule } from './trip-day-density-planner';
+import { planDaySchedule, type TripSchedulePolicy } from './trip-day-density-planner';
 import type { ResolvedTripPlaceStop } from './trip-place-resolver';
 
 export class TripBuilderError extends Error {
@@ -38,6 +39,7 @@ export interface BuildTripInput {
   tripId: string;
   userId: string;
   createdAt: string;
+  planningPolicy?: TripSchedulePolicy;
 }
 
 export interface TripBuildDiagnostics {
@@ -431,11 +433,31 @@ function clonePreferences(requirement: ConfirmedTripRequirement): TripPreference
   };
 }
 
+function tripPlanningContextFromRequirement(
+  requirement: ConfirmedTripRequirement,
+): TripPlanningContextV1 | undefined {
+  const context: TripPlanningContextV1 = {};
+  if (requirement.tripIntent) context.tripIntent = structuredClone(requirement.tripIntent);
+  if (requirement.partyContext) context.partyContext = structuredClone(requirement.partyContext);
+  if (requirement.constraints) context.constraints = structuredClone(requirement.constraints);
+  return Object.keys(context).length > 0 ? context : undefined;
+}
+
 function dayDate(requirement: ConfirmedTripRequirement, dayNumber: number): string {
   if (!requirement.startDate) {
     return '';
   }
   return addUtcCalendarDays(requirement.startDate, dayNumber - 1);
+}
+
+function withoutHotelStops(day: RouteEnrichedTripPlanDay): RouteEnrichedTripPlanDay {
+  const stops = day.stops.filter((stop) => stop.place.category !== 'hotel');
+  const ids = new Set(stops.map((stop) => stop.place.id));
+  return {
+    ...day,
+    stops,
+    routes: day.routes.filter((route) => ids.has(route.fromPlaceId) && ids.has(route.toPlaceId)),
+  };
 }
 
 function buildDayPlaces(
@@ -517,7 +539,8 @@ export class ConfirmedTripBuilder implements TripBuilder {
     const days: TripDay[] = [];
     const routes: TripRoute[] = [];
 
-    for (const planDay of plan.days) {
+    for (const rawDay of plan.days) {
+      const planDay = withoutHotelStops(rawDay);
       const dayId = `${tripId}:day:${planDay.dayNumber}`;
       const places = buildDayPlaces(tripId, dayId, planDay);
       const planned = planDaySchedule({
@@ -528,12 +551,16 @@ export class ConfirmedTripBuilder implements TripBuilder {
         places,
         dayNumber: planDay.dayNumber,
         dayTitle: planDay.title,
+        planningPolicy: input.planningPolicy,
       });
       const scheduledById = new Map(planned.places.map((place) => [place.id, place]));
       for (const place of places) {
         const scheduled = scheduledById.get(place.id);
         if (scheduled?.startTime) {
           place.startTime = scheduled.startTime;
+        }
+        if (typeof scheduled?.durationMinutes === 'number') {
+          place.durationMinutes = scheduled.durationMinutes;
         }
       }
       const day: TripDay = {
@@ -578,6 +605,10 @@ export class ConfirmedTripBuilder implements TripBuilder {
     }
     if (requirement.endDate) {
       trip.endDate = requirement.endDate;
+    }
+    const planningContext = tripPlanningContextFromRequirement(requirement);
+    if (planningContext) {
+      trip.planningContext = planningContext;
     }
 
     return {

@@ -9,6 +9,7 @@ import {
   type ReplacePlaceSummary,
   type TripChangeApplyResult,
   type TripChangeApplyService,
+  type TripChangeFocus,
   type TripChangeIntent,
   type TripChangeInterpretService,
 } from './bff-trip-change-service';
@@ -30,10 +31,11 @@ export function isUndoToastActive(startedAtMs: number, nowMs: number): boolean {
 
 export type TripChangeOutcome =
   | { status: 'needs_clarification'; summary: string; intent: TripChangeIntent }
+  | { status: 'needs_choice'; summary: string; intent: TripChangeIntent }
   | { status: 'applied'; result: TripChangeApplyResult };
 
 export interface TripChangeService {
-  interpret(input: string, trip: Trip): Promise<TripChangeIntent>;
+  interpret(input: string, trip: Trip, focus?: TripChangeFocus): Promise<TripChangeIntent>;
   apply(input: {
     trip: Trip;
     places: Place[];
@@ -53,6 +55,11 @@ export class TripChangeStaleError extends Error {
     super(message);
     this.name = 'TripChangeStaleError';
   }
+}
+
+export function isSemanticTripChangeError(error: unknown): boolean {
+  return error instanceof BffClientError
+    && (error.code === 'INVALID_REQUEST' || error.code === 'AI_INVALID_REQUEST');
 }
 
 export function noticeForTripChangeError(error: unknown): string {
@@ -89,8 +96,8 @@ export class AutoApplyTripChangeService implements TripChangeService {
     private readonly applyService: TripChangeApplyService,
   ) {}
 
-  async interpret(input: string, trip: Trip): Promise<TripChangeIntent> {
-    return this.interpretService.interpret(input, trip);
+  async interpret(input: string, trip: Trip, focus?: TripChangeFocus): Promise<TripChangeIntent> {
+    return this.interpretService.interpret(input, trip, focus);
   }
 
   async apply(input: {
@@ -112,6 +119,9 @@ export class AutoApplyTripChangeService implements TripChangeService {
       throw new TripChangeStaleError();
     }
     const intent = await this.interpretService.interpret(input.text, input.trip);
+    if (intent.status === 'needs_choice') {
+      return { status: 'needs_choice', summary: intent.summary, intent };
+    }
     if (intent.status === 'needs_clarification' || !isReadyReplaceIntent(intent)) {
       return { status: 'needs_clarification', summary: intent.summary, intent };
     }

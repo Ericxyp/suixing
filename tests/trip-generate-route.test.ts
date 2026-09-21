@@ -290,7 +290,7 @@ test('maps AI and quality failures without leaking internals', async () => {
 
   const incomplete = await request({
     orchestrator: new FakeOrchestrator(async () => {
-      throw new TripGenerationIncompleteError();
+      throw new TripGenerationIncompleteError({ validationReason: 'INSUFFICIENT_CORE_PLACES' });
     }),
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ requirement }),
@@ -300,6 +300,9 @@ test('maps AI and quality failures without leaking internals', async () => {
     error: { code: 'TRIP_GENERATION_INCOMPLETE', message: TRIP_GENERATION_INCOMPLETE_MESSAGE },
   });
   assert.equal(incomplete.text.includes('unresolved'), false);
+  assert.equal(incomplete.text.includes('DAY_ENDS_TOO_EARLY'), false);
+  assert.equal(incomplete.text.includes('INSUFFICIENT_CORE_PLACES'), false);
+  assert.equal(incomplete.text.includes('validationReason'), false);
 
   const placeProviderError = await request({
     orchestrator: new FakeOrchestrator(async () => {

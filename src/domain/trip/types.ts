@@ -1,3 +1,5 @@
+import type { TripPlanningContextV1 } from './profile';
+
 export type TripStatus = 'PLANNING' | 'READY' | 'TRAVELLING' | 'COMPLETED';
 
 export type TripPace = 'relaxed' | 'balanced' | 'packed';
@@ -168,6 +170,7 @@ export interface Trip {
   currency: Currency;
   pace: TripPace;
   preferences: TripPreference;
+  planningContext?: TripPlanningContextV1;
   status: TripStatus;
   days: TripDay[];
   routes: TripRoute[];
